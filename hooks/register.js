@@ -162,6 +162,7 @@ const LINE = { plugin: 'troxy-guard', key: 'line' };
 const SAVINGS = { plugin: 'troxy-guard', key: 'savings' }; // the band's compression + trimming text
 const SAVED = { plugin: 'troxy-guard', key: 'saved' }; // { paid, full, meter }; survives a troxy update
 const TROXY_TEAL = '#0a9e88';
+const CONNECT = { plugin: 'troxy-guard', key: 'connect' }; // the band's connect code until approved (the desktop app shows no status line)
 const ROUTE = { plugin: 'troxy-guard', key: 'route' }; // the band's note on this step's model, when Troxy changed it
 // The routing decision, shown in the band so a swapped model is never silent.
 function routeText(want, model) {
@@ -234,7 +235,8 @@ async function routingOff($) {
 // dash.troxy.io/activate. The key then lands in ~/.troxy/config.json (0600), no copy-paste.
 let connecting = null;
 async function connectDevice($) {
-  if (connecting || (await troxyConfig($)).apiKey) return;
+  if (connecting) return;
+  if ((await troxyConfig($)).apiKey) { await $.state.set(CONNECT, null); return; }
   const home = await $.env.get('HOME');
   if (!home) return;
   let start;
@@ -250,6 +252,7 @@ async function connectDevice($) {
   const ask = `Connect Troxy: open ${link} and approve code ${start.user_code}`;
   $.ui.status(ask);
   $.ui.toast(ask);
+  await $.state.set(CONNECT, ask);
   const until = Date.now() + start.expires_in * 1000;
   connecting = $.clock.every(Math.max(5, start.interval || 5) * 1000, async () => {
     let body = null;
@@ -262,7 +265,9 @@ async function connectDevice($) {
     if (body.status === 'pending' && Date.now() < until) return;
     connecting.cancel(); connecting = null;
     if (body.status !== 'approved' || !body.key) {
-      $.ui.status('Troxy: the connect code expired. Start a new session for a fresh one.');
+      const gone = 'Troxy: the connect code expired. Type /reload-plugins for a new one.';
+      $.ui.status(gone);
+      await $.state.set(CONNECT, gone);
       return;
     }
     const path = `${home}/.troxy/config.json`;
@@ -271,6 +276,7 @@ async function connectDevice($) {
     await $.fs.write(path, JSON.stringify({ ...cfg, apiKey: body.key, agentName: body.name, reportUsage: true, viaProxy: false }, null, 2));
     try { await $.process.run(['chmod', '600', path]); } catch {} // fs.write cannot set a mode
     $.ui.status(undefined);
+    await $.state.set(CONNECT, null);
     $.ui.toast('Troxy is connected. It starts working on your next message.');
   });
 }
@@ -974,6 +980,8 @@ export function register(on) {
     for (const [k, label] of [['routing', 'model routing'], ['compact_after_answer', 'compacting after an answer past 200k'], ['idle_compact', 'idle compaction']]) {
       if (await switchedOff($, k)) settingsOff.push(label);
     }
+    const { value: connect } = await $.state.get(CONNECT);
+    if (connect) return { text: connect };
     return { text: statusText({ version: manifest.version, paused: r.paused || await switchedOff($, 'routing'), savings: (await $.state.get(SAVINGS)).value, rateLimits: (await $.session.usage()).rateLimits,
       compactOff: Boolean(await $.store.get('compactOff')) || await switchedOff($, 'idle_compact'), settingsOff }) };
   });
@@ -995,6 +1003,8 @@ export function register(on) {
     const { value: note } = await $.state.get(COMPACTED);
     const { value: kept } = await $.state.get(SAVINGS);
     const { value: route } = await $.state.get(ROUTE);
+    const { value: connect } = await $.state.get(CONNECT);
+    if (connect) { const { Text } = $.ui.resolve(e); return h(Text, { color: TROXY_TEAL }, connect); }
     if ((!line && !kept && !note && !route) || e.props.hasSurvey) return next(e);
     const { Text } = $.ui.resolve(e);
     return h(Text, { color: TROXY_TEAL }, `Troxy · ${[route, kept, line, note && note.text].filter(Boolean).join(' · ')}`);
