@@ -246,7 +246,7 @@ async function connectDevice($) {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name: user ? `${user}'s Claude Code` : 'Claude Code' }) });
     if (!res.ok) return;
-    start = await res.json();
+    start = JSON.parse(res.text); // $.http.fetch gives text, no .json()
   } catch { return; }
   const link = `${start.verification_uri}?code=${start.user_code}`;
   const ask = `Connect Troxy: open ${link} and approve code ${start.user_code}`;
@@ -260,7 +260,7 @@ async function connectDevice($) {
       const res = await troxyFetch($, 'https://api.troxy.io/device/poll', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ device_code: start.device_code }) });
-      body = await res.json();
+      body = JSON.parse(res.text);
     } catch { return; } // offline for a moment: try again next tick
     if (body.status === 'pending' && Date.now() < until) return;
     connecting.cancel(); connecting = null;
