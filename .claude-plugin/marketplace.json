@@ -1,0 +1,16 @@
+{
+  "name": "troxy",
+  "owner": {
+    "name": "Troxy"
+  },
+  "plugins": [
+    {
+      "name": "troxy-guard",
+      "source": "./",
+      "description": "Troxy keeps your Claude usage bar going longer."
+    }
+  ],
+  "metadata": {
+    "description": "Troxy for Claude Code: keeps your usage bar going longer."
+  }
+}

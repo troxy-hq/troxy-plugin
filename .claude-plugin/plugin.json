@@ -1,0 +1,9 @@
+{
+  "name": "troxy-guard",
+  "version": "1.40.0",
+  "description": "Troxy keeps your Claude usage bar going longer. Type /troxy off to pause it.",
+  "author": {
+    "name": "Troxy"
+  },
+  "types": "./types/index.d.ts"
+}
