@@ -291,8 +291,8 @@ async function troxyFetch($, url, init = {}) {
 async function fetchSavings($) {
   const sid = await $.session.id();
   if (!/^[A-Za-z0-9-]{8,64}$/.test(String(sid))) return null;
-  const { apiKey } = await troxyConfig($);
-  if (!apiKey) return null;
+  const { apiKey, reportUsage } = await troxyConfig($);
+  if (!apiKey || reportUsage === false) return null; // opted out: not even the session id leaves
   const res = await troxyFetch($, `https://api.troxy.io/mcp/session-savings?session_id=${sid}`, { headers: { 'x-troxy-key': apiKey } });
   if (!res.ok) return null;
   const body = JSON.parse(res.text);
