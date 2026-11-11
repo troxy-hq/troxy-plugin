@@ -1004,7 +1004,13 @@ export function register(on) {
     const { value: kept } = await $.state.get(SAVINGS);
     const { value: route } = await $.state.get(ROUTE);
     const { value: connect } = await $.state.get(CONNECT);
-    if (connect) { const { Text } = $.ui.resolve(e); return h(Text, { color: TROXY_TEAL }, connect); }
+    if (connect) {
+      const { Text, Link } = $.ui.resolve(e);
+      const url = (connect.match(/https:\/\/\S+/) || [])[0];
+      if (!url || !Link) return h(Text, { color: TROXY_TEAL }, connect);
+      const [before, after] = connect.split(url); // the link is clickable; plain text is not
+      return h(Text, { color: TROXY_TEAL }, before, h(Link, { href: url }, url), after);
+    }
     if ((!line && !kept && !note && !route) || e.props.hasSurvey) return next(e);
     const { Text } = $.ui.resolve(e);
     return h(Text, { color: TROXY_TEAL }, `Troxy · ${[route, kept, line, note && note.text].filter(Boolean).join(' · ')}`);

@@ -1,6 +1,6 @@
 {
   "name": "troxy-guard",
-  "version": "1.40.3",
+  "version": "1.40.4",
   "description": "Troxy keeps your Claude usage bar going longer. Type /troxy off to pause it.",
   "author": {
     "name": "Troxy"
