@@ -366,6 +366,21 @@ async function noteStep($, result, meta) {
   if (pending.length > REPORT_KEEP_ROWS) pending = pending.slice(-REPORT_KEEP_ROWS);
 }
 
+// Same local log as the CLI (~/.troxy/sent.log, shown by `troxy privacy`, capped at 512 KB).
+// ponytail: read-then-write (fs has no append); a CLI write at the same instant can be lost.
+async function logSent($, path, body) {
+  try {
+    const home = await $.env.get('HOME');
+    if (!home) return;
+    const f = `${home}/.troxy/sent.log`;
+    let old = '';
+    try { old = await $.fs.read(f); } catch {}
+    if (old.length > 512 * 1024) old = '';
+    await $.fs.write(f, old + JSON.stringify({ ts: new Date(await $.clock.now()).toISOString(), method: 'POST', path, body, from: 'add-on' }) + '\n');
+    if (!old) try { await $.process.run(['chmod', '600', f]); } catch {}
+  } catch {}
+}
+
 async function flushReport($) {
   if (!pending.length) return;
   const { apiKey, reportUsage, viaProxy } = await troxyConfig($);
@@ -376,6 +391,7 @@ async function flushReport($) {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-troxy-key': apiKey }, body: JSON.stringify({ rows }),
     });
     if (!res.ok && res.status >= 500) return; // kept for the next turn
+    if (res.ok) await logSent($, '/mcp/usage-report', { rows });
     pending = pending.slice(rows.length); // sent, or refused as invalid: never resent
   }
 }
@@ -1048,4 +1064,4 @@ export function register(on) {
 }
 
 // Exported for tests only - not part of the mod's runtime contract.
-export const _internal = { connectDevice, effortArmFor, clearArmFor, clearHint, clearFlags, effortSwapOn, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, idleCompact, switchedOff, compactArmFor, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, maskArmFor, warnModelSwitch, modelWarned, subAgents, stepModel, lastSent };
+export const _internal = { connectDevice, effortArmFor, clearArmFor, clearHint, clearFlags, effortSwapOn, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, idleCompact, switchedOff, compactArmFor, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, maskArmFor, warnModelSwitch, modelWarned, subAgents, stepModel, lastSent };
