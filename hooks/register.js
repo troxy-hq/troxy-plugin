@@ -205,7 +205,7 @@ function sessionLine(t) {
 function savingsText(s, arm) {
   const calls = (s && s.calls) || 0, routed = (s && s.routed_calls) || 0;
   if (!calls) return undefined;
-  if (arm === 'holdout') return 'comparison session: Troxy keeps your model here to measure its effect';
+  if (arm === 'holdout') return 'comparison stretch: Troxy is off here to measure its effect';
   return routed ? `${Math.max(1, Math.round(routed / calls * 100))}% of this session ran on a lighter model` : undefined; // nothing to say until a call moves
 }
 
@@ -327,8 +327,8 @@ function reportRow({ sid, usage, requested, arm, cold, score, compact, compactAr
     compressed_tokens: compressed > 0 ? compressed : null,
     recalled_tokens: recalled > 0 ? recalled : null,
     sub_arm: subArm || null, agent_id: agentId || null,
-    // One arm per lever, so each gets its own number (launch review: measurement).
-    levers: { mask_arm: maskArmFor(sid), effort_arm: effortArmFor(sid), clear_arm: clearArmFor(sid), ...(clear || {}), ...(mask ? { mask } : {}), ...(cutArm ? { cut_arm: cutArm, cut } : {}) },
+    // Every lever follows the session arm since 1.41.0 (sessionArm); the keys stay so old rows still read.
+    levers: { mask_arm: arm || null, effort_arm: arm || null, clear_arm: arm || null, ...(clear || {}), ...(mask ? { mask } : {}), ...(cutArm ? { cut_arm: cutArm, cut } : {}) },
     surface: (surfaces || []).includes('desktop') ? 'desktop' : (surfaces || []).includes('terminal') ? 'terminal' : null,
   };
 }
@@ -362,7 +362,7 @@ async function noteStep($, result, meta) {
   const sid = await $.session.id();
   const mask = lastMask; lastMask = null;
   const clear = await clearFlags($, sid, await $.clock.now());
-  pending.push(reportRow({ ...meta, mask, clear, sid, usage, compact: compacting, compactArm: compactArmFor(sid), rateLimits, surfaces, compressed: await compressedSince($, sid), recalled: await recalledSince($, sid), ts: await $.clock.now() }));
+  pending.push(reportRow({ ...meta, mask, clear, sid, usage, compact: compacting, compactArm: meta.arm, rateLimits, surfaces, compressed: await compressedSince($, sid), recalled: await recalledSince($, sid), ts: await $.clock.now() }));
   if (pending.length > REPORT_KEEP_ROWS) pending = pending.slice(-REPORT_KEEP_ROWS);
 }
 
@@ -471,16 +471,10 @@ async function bigCompactOn($) {
   return !(await switchedOff($, 'compact_after_answer')) && !(await compactHoldout($));
 }
 
-// Compaction holdout: 10% of sessions get none of Troxy's compaction (after an answer or idle),
-// picked from the session id, so it survives restarts and resumes with nothing stored. Every
-// reported request carries the arm, so real use compares the two (2026-11-09: the lab A/B could not).
-function compactArmFor(sid) {
-  let h = 0;
-  for (const c of String(sid)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-  return h % 10 === 0 ? 'holdout' : 'treated';
-}
+// Compaction holdout: the session arm (sessionArm). A holdout stretch gets none of Troxy's
+// compaction, after an answer or idle.
 async function compactHoldout($) {
-  try { return compactArmFor(await $.session.id()) === 'holdout'; } catch { return false; }
+  try { return (await sessionArm($, await $.session.id())) === 'holdout'; } catch { return false; }
 }
 
 // What to do when the idle timer fires: skip, compact now, or wait for the meter to reset.
@@ -579,13 +573,13 @@ let lastNote = null;
 let decision = null;
 
 // Lever 5: back after a long break, the old context may be for another task. Say
-// once per session that /clear starts fresh; never clear. Half the sessions see
-// it (levers.clear_arm), so its effect on the bar can be measured.
+// once per session that /clear starts fresh; never clear. Treated stretches see
+// it (sessionArm), so its effect on the bar can be measured.
 // ponytail: no topic check, the gap alone triggers it; add one if users find it noisy.
 const CLEAR_HINT_GAP_MS = 60 * 60 * 1000;
 const CLEAR_HINT_MIN_TOKENS = 30000;
 async function clearHint($, sid, gapMs) {
-  if (clearArmFor(sid) !== 'treated' || (await $.env.get('TROXY_CLEAR_HINT')) === '0') return false;
+  if ((await sessionArm($, sid)) !== 'treated' || (await $.env.get('TROXY_CLEAR_HINT')) === '0') return false;
   if (await $.store.get(`clear_hint:${sid}`)) return false;
   const u = await $.session.usage();
   const tokens = (u.context && u.context.tokens) || 0;
@@ -679,6 +673,27 @@ const coldNext = new Set();
 // doesn't route mod sessions either), so treated vs holdout is a clean A/B.
 const ARM = { plugin: 'troxy-guard', key: 'arm' };
 const holdoutDraw = { fraction: 0.5 }; // 50/50 so one user's own sessions give a real routed-vs-untouched comparison; tests set it
+
+// One arm for everything Troxy does (1.41.0): a holdout stretch gets nothing (no routing,
+// compaction, effort, subagent models, masking, /clear hint), a treated one gets all of it,
+// so treated vs holdout is one number for the whole stack. Kept on disk ($.state is per
+// process; every `claude -p` step, resume and restart would re-roll it). Drawn again at each
+// idle-cold moment (first step, 55+ min idle), once per gap: the idle timer, the returning
+// prompt or the step, whichever asks first, draws and the rest keep it, so an idle compaction
+// belongs to the stretch it serves. Not after a compaction: that would hand the compacted
+// context to a holdout stretch. ponytail: a stretch still inherits the context the one before
+// left, which pulls the gap toward 0; per-session arms need more users than we have.
+async function sessionArm($, sid) {
+  const now = await $.clock.now();
+  const ls = await lastSentFor($, sid);
+  let arm = null, at = null;
+  try { arm = await $.store.get(`arm:${sid}`); at = await $.store.get(`arm_at:${sid}`); } catch {}
+  const drawnThisGap = typeof at === 'number' && (!ls || at > ls.at);
+  if ((arm === 'holdout' || arm === 'treated') && (drawnThisGap || (ls && now - ls.at < WARM_MS))) return arm;
+  arm = Math.random() < holdoutDraw.fraction ? 'holdout' : 'treated';
+  try { await $.store.set(`arm:${sid}`, arm); await $.store.set(`arm_at:${sid}`, now); } catch {}
+  return arm;
+}
 // The model the user asked for and the one that ran, per session, kept across restarts.
 // The transcript records only the model that ran, so `claude --resume` reopens a routed
 // session on Haiku; without this the mod would take Haiku as the user's pick for good.
@@ -715,8 +730,7 @@ function stepModel({ arm, requested, switched, cold, score, warm, haiku = false,
 // per message, which keeps the prompt cache (tested 2026-10-20: about 65 cache tokens
 // written on a changed turn, same as an unchanged one). The 10-20 A/B with a low
 // band took more steps, so the floor is now medium (launch review lever 3: never
-// below medium). On for half the sessions (levers.effort_arm); TROXY_EFFORT_SWAP=1
-// or config effortSwap turns it on everywhere, TROXY_EFFORT_SWAP=0 off everywhere.
+// below medium). On in treated stretches (sessionArm); TROXY_EFFORT_SWAP=0 turns it off.
 const EFFORT_RANK = { low: 0, medium: 1, high: 2, xhigh: 3, max: 4 };
 const EFFORT_MEDIUM_BELOW = 0.85;
 function stepEffort({ arm, requested, score, on }) {
@@ -724,18 +738,9 @@ function stepEffort({ arm, requested, score, on }) {
   const cap = score < EFFORT_MEDIUM_BELOW ? 'medium' : null;
   return cap && EFFORT_RANK[cap] < EFFORT_RANK[requested] ? cap : requested;
 }
-function armFor(sid, seed) {
-  let h = seed;
-  for (const c of String(sid)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-  return h % 2 === 0 ? 'treated' : 'holdout';
-}
-const effortArmFor = (sid) => armFor(sid, 11);
-const clearArmFor = (sid) => armFor(sid, 13);
-async function effortSwapOn($, sid) {
-  const env = await $.env.get('TROXY_EFFORT_SWAP');
-  if (env === '0') return false;
-  if (env === '1' || (await troxyConfig($)).effortSwap) return true;
-  return effortArmFor(sid) === 'treated';
+// On in treated stretches (stepEffort checks the arm); TROXY_EFFORT_SWAP=0 turns it off.
+async function effortSwapOn($) {
+  return (await $.env.get('TROXY_EFFORT_SWAP')) !== '0';
 }
 
 async function haikuBandOn($) {
@@ -746,9 +751,8 @@ async function haikuBandOn($) {
 // Subagent routing at spawn: a new subagent has no warm cache to lose, so its model is
 // picked when it starts. Read-only lookups (Explore) go to Haiku, general work to Sonnet;
 // never up, never Plan, a fork, a teammate, a custom agent or a model the caller named.
-// Treated sessions only, with half the spawns held out to measure it (route_reason sub_*).
+// Treated stretches only (sessionArm); every eligible spawn is routed (route_reason sub_treated).
 const SUB_ROUTE = { Explore: 'haiku', 'general-purpose': 'sonnet' };
-const SUB_HOLDOUT_FRACTION = 0.5;
 // agentId -> { asked, subArm }. ponytail: in memory, so a restart mid-subagent reports its
 // remaining steps without the sub arm.
 const subAgents = new Map();
@@ -762,18 +766,16 @@ async function routeSpawn($, e, next) {
   try { arm = await $.store.get(`arm:${await $.session.id()}`); off = await routingOff($); } catch {}
   const target = off ? null : subagentTarget({ ...e, arm });
   if (!target) return next(e);
-  const subArm = Math.random() < SUB_HOLDOUT_FRACTION ? 'holdout' : 'treated';
-  const r = await next(subArm === 'treated' ? { ...e, model: target } : e);
-  if (r && r.agentId) subAgents.set(r.agentId, { asked: subArm === 'holdout' ? r.model : e.parentModel, subArm });
+  const r = await next({ ...e, model: target });
+  if (r && r.agentId) subAgents.set(r.agentId, { asked: e.parentModel, subArm: 'treated' });
   return r;
 }
 
 // Per-user routing cut (launch review lever 9). One global 0.85 cut routes too much for some
 // users and too little for others, so each user's own regret signals move it: a /model back
 // up, a /rewind or a "that's wrong" right after a routed step. Kept across sessions in $.store.
-// Half the sessions keep 0.85 (cut arm holdout) so the lever gets its own number.
+// Treated stretches only (sessionArm); a holdout stretch is never routed anyway.
 // ponytail: 4 fixed bands from a raw regret rate; fit it from the data once there is some.
-const CUT_ARM_FRACTION = 0.5;
 const CUT_MIN_ROUTED = 20;
 const REGRET_TEXT = /^\s*(no[,.! ]|nope\b|wrong\b|that'?s (wrong|not right|incorrect)|this is wrong|undo\b|revert\b)/i;
 function userCut({ routed = 0, regret = 0 } = {}) {
@@ -791,28 +793,17 @@ async function noteRegret($, sid) {
   await $.store.set('regret', { routed: s.routed, regret: s.regret + 1 });
   return true;
 }
-async function cutFor($, sid) {
-  let a = await $.store.get(`cut_arm:${sid}`);
-  if (a !== 'treated' && a !== 'holdout') {
-    a = Math.random() < CUT_ARM_FRACTION ? 'holdout' : 'treated';
-    await $.store.set(`cut_arm:${sid}`, a);
-  }
-  return { cutArm: a, cut: a === 'treated' ? userCut(await $.store.get('regret')) : BANDS[0][0] };
+async function cutFor($, arm) {
+  return { cutArm: arm, cut: arm === 'treated' ? userCut(await $.store.get('regret')) : BANDS[0][0] };
 }
 
 // Stub old tool output before compacting (launch review lever 4). Most of a big session is
 // old tool output the next task never reads again, so it is cut to a one-line stub with no
 // model call; only if the session is still big after that does the summarizer run, over the
-// smaller text. Troxy's own compactions only (trigger plugin), main loop, half the sessions
-// (mask arm, from the session id so it survives restarts).
+// smaller text. Troxy's own compactions only (trigger plugin), main loop, treated stretches.
 const MASK_KEEP_RECENT = 12; // messages at the end kept whole, with their engine handles
 const MASK_MIN_CHARS = 400; // a result shorter than this is kept
 const MASK_ENOUGH_TOKENS = 60000; // after stubbing, at or under this: no summary needed
-function maskArmFor(sid) {
-  let h = 7;
-  for (const c of String(sid)) h = (h * 33 + c.charCodeAt(0)) >>> 0;
-  return h % 2 === 0 ? 'treated' : 'holdout';
-}
 const stub = (tool) => `[${tool || 'tool'} output removed by Troxy to save space; run it again if it is needed]`;
 function stubInput(input) {
   const out = {};
@@ -863,7 +854,7 @@ let lastMask = null; // what the last compaction did, for the report row: 'stub'
 async function maskCompact($, e, next) {
   if (e.trigger !== 'plugin' || e.agentId || !Array.isArray(e.messages)) return next(e);
   const sid = await $.session.id();
-  if (maskArmFor(sid) !== 'treated' || (await $.env.get('TROXY_MASK')) === '0') return next(e);
+  if ((await sessionArm($, sid)) !== 'treated' || (await $.env.get('TROXY_MASK')) === '0') return next(e);
   const before = messagesTokens(e.messages);
   const { messages, removedChars } = maskMessages(e.messages);
   if (!removedChars) return next(e);
@@ -910,18 +901,9 @@ async function* routeStep($, e, next) {
   }
   const sid = await $.session.id();
   const now = await $.clock.now();
-  // The arm is kept on disk per session: $.state is per process, so every `claude -p` step,
-  // resume and restart re-rolled the 10% holdout and pinned most sessions to the requested model.
-  // The arm is drawn again at every cold moment: the cache is gone anyway, so a switch costs
-  // nothing, and a session left open for days still splits 50/50 instead of one arm for good.
   const ls = await lastSentFor($, sid);
   const isCold = !ls || now - ls.at >= WARM_MS || coldNext.has(sid);
-  let arm = null;
-  try { arm = await $.store.get(`arm:${sid}`); } catch {}
-  if (isCold || (arm !== 'holdout' && arm !== 'treated')) {
-    arm = Math.random() < holdoutDraw.fraction ? 'holdout' : 'treated';
-    try { await $.store.set(`arm:${sid}`, arm); } catch {}
-  }
+  const arm = await sessionArm($, sid);
   await $.state.set(ARM, arm);
   const prev = lastAsked.get(sid);
   lastAsked.set(sid, e.model);
@@ -931,7 +913,7 @@ async function* routeStep($, e, next) {
   // /model was counted in warnModelSwitch, which cleared lastRouted).
   if (switched && ls && RANK[tierOf(e.model)] > RANK[tierOf(ls.model)]) try { await noteRegret($, sid); } catch {}
   let cut = BANDS[0][0], cutArm = null;
-  try { ({ cut, cutArm } = await cutFor($, sid)); } catch {}
+  try { ({ cut, cutArm } = await cutFor($, arm)); } catch {}
   const model = (await routingOff($)) ? want : stepModel({
     arm, requested: want, switched,
     cold: isCold,
@@ -962,7 +944,7 @@ async function* routeStep($, e, next) {
   if (model !== want && turn) turn.ratio = PRICE[tierOf(want)] / PRICE[tierOf(model)];
   let effort = e.effort;
   if (!(await routingOff($))) {
-    try { effort = stepEffort({ arm, requested: e.effort, score: decision ? decision.score : null, on: await effortSwapOn($, sid) }); } catch {}
+    try { effort = stepEffort({ arm, requested: e.effort, score: decision ? decision.score : null, on: await effortSwapOn($) }); } catch {}
   }
   const sent = model === e.model && effort === e.effort ? e : { ...e, model, ...(effort === undefined ? {} : { effort }) };
   const result = yield* next(sent);
@@ -1066,4 +1048,4 @@ export function register(on) {
 }
 
 // Exported for tests only - not part of the mod's runtime contract.
-export const _internal = { holdoutDraw, connectDevice, effortArmFor, clearArmFor, clearHint, clearFlags, effortSwapOn, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, idleCompact, switchedOff, compactArmFor, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, maskArmFor, warnModelSwitch, modelWarned, subAgents, stepModel, lastSent };
+export const _internal = { holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, warnModelSwitch, modelWarned, subAgents, stepModel, lastSent };
