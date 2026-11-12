@@ -678,7 +678,7 @@ const coldNext = new Set();
 // One router per session, measured: a holdout session is never routed (the proxy
 // doesn't route mod sessions either), so treated vs holdout is a clean A/B.
 const ARM = { plugin: 'troxy-guard', key: 'arm' };
-const MOD_HOLDOUT_FRACTION = 0.5; // 50/50 so one user's own sessions give a real routed-vs-untouched comparison
+const holdoutDraw = { fraction: 0.5 }; // 50/50 so one user's own sessions give a real routed-vs-untouched comparison; tests set it
 // The model the user asked for and the one that ran, per session, kept across restarts.
 // The transcript records only the model that ran, so `claude --resume` reopens a routed
 // session on Haiku; without this the mod would take Haiku as the user's pick for good.
@@ -912,10 +912,14 @@ async function* routeStep($, e, next) {
   const now = await $.clock.now();
   // The arm is kept on disk per session: $.state is per process, so every `claude -p` step,
   // resume and restart re-rolled the 10% holdout and pinned most sessions to the requested model.
+  // The arm is drawn again at every cold moment: the cache is gone anyway, so a switch costs
+  // nothing, and a session left open for days still splits 50/50 instead of one arm for good.
+  const ls = await lastSentFor($, sid);
+  const isCold = !ls || now - ls.at >= WARM_MS || coldNext.has(sid);
   let arm = null;
   try { arm = await $.store.get(`arm:${sid}`); } catch {}
-  if (arm !== 'holdout' && arm !== 'treated') {
-    arm = Math.random() < MOD_HOLDOUT_FRACTION ? 'holdout' : 'treated';
+  if (isCold || (arm !== 'holdout' && arm !== 'treated')) {
+    arm = Math.random() < holdoutDraw.fraction ? 'holdout' : 'treated';
     try { await $.store.set(`arm:${sid}`, arm); } catch {}
   }
   await $.state.set(ARM, arm);
@@ -923,13 +927,11 @@ async function* routeStep($, e, next) {
   lastAsked.set(sid, e.model);
   const switched = Boolean(prev && prev !== e.model);
   const want = await askedFor($, sid, e.model, switched);
-  const ls = await lastSentFor($, sid);
   // A /model back up from a model Troxy picked is a regret (the picker path; a typed
   // /model was counted in warnModelSwitch, which cleared lastRouted).
   if (switched && ls && RANK[tierOf(e.model)] > RANK[tierOf(ls.model)]) try { await noteRegret($, sid); } catch {}
   let cut = BANDS[0][0], cutArm = null;
   try { ({ cut, cutArm } = await cutFor($, sid)); } catch {}
-  const isCold = !ls || now - ls.at >= WARM_MS || coldNext.has(sid);
   const model = (await routingOff($)) ? want : stepModel({
     arm, requested: want, switched,
     cold: isCold,
@@ -1064,4 +1066,4 @@ export function register(on) {
 }
 
 // Exported for tests only - not part of the mod's runtime contract.
-export const _internal = { connectDevice, effortArmFor, clearArmFor, clearHint, clearFlags, effortSwapOn, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, idleCompact, switchedOff, compactArmFor, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, maskArmFor, warnModelSwitch, modelWarned, subAgents, stepModel, lastSent };
+export const _internal = { holdoutDraw, connectDevice, effortArmFor, clearArmFor, clearHint, clearFlags, effortSwapOn, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, idleCompact, switchedOff, compactArmFor, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, maskArmFor, warnModelSwitch, modelWarned, subAgents, stepModel, lastSent };
