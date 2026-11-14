@@ -141,9 +141,11 @@ function pickModel(score, requested, contextTokens, warm, haiku = false, cut = B
 // /troxy off|on|status. Pure so it can be tested; the hook below stores the result.
 function troxyCommand(args, paused) {
   const a = String(args || '').trim().toLowerCase();
-  if (a === 'off') return { paused: true, text: 'Troxy routing is off. Your chosen model is used as-is. Type /troxy on to resume.' };
-  if (a === 'on') return { paused: false, text: 'Troxy routing is on.' };
-  return { paused, text: paused ? 'Troxy routing is off. Type /troxy on to resume.' : 'Troxy routing is on. Type /troxy off to pause it.' };
+  // Off means everything (launch re-review 2026-11-12): no model, effort or subagent change, no
+  // compaction, no masking, nothing kept awake, no /clear hint. Not only routing.
+  if (a === 'off') return { paused: true, text: 'Troxy is off on this machine: no model, effort or subagent changes, no compaction, nothing kept awake. Your chosen model is used as-is. Type /troxy on to resume.' };
+  if (a === 'on') return { paused: false, text: 'Troxy is on.' };
+  return { paused, text: paused ? 'Troxy is off. Type /troxy on to resume.' : 'Troxy is on. Type /troxy off to pause it.' };
 }
 
 
@@ -163,7 +165,7 @@ const SAVINGS = { plugin: 'troxy-guard', key: 'savings' }; // the band's compres
 const SAVED = { plugin: 'troxy-guard', key: 'saved' }; // { paid, full, meter }; survives a troxy update
 const TROXY_TEAL = '#0a9e88';
 const CONNECT = { plugin: 'troxy-guard', key: 'connect' }; // the band's connect code until approved (the desktop app shows no status line)
-const ROUTE = { plugin: 'troxy-guard', key: 'route' }; // the band's note on this step's model, when Troxy changed it
+const ROUTE = { plugin: 'troxy-guard', key: 'route' }; // the band's note on this step's model and effort, when Troxy changed them
 // The routing decision, shown in the band so a swapped model is never silent.
 function routeText(want, model) {
   return model && want && model !== want ? `now on ${tierOf(model) || model} (you picked ${tierOf(want) || want}; /troxy off keeps it)` : null;
@@ -221,19 +223,59 @@ async function troxyConfig($) {
   return { ...cfg, apiKey: (await $.env.get('TROXY_API_KEY')) || cfg.apiKey };
 }
 
+// Connected: this machine has a Troxy key. Until then no lever runs (no scorer call, no model,
+// effort or subagent change, no compaction, keep-awake or masking), so installing the add-on changes
+// nothing in a session before the person approves the connect code, and no step runs unmeasured
+// (rows without a key are dropped). Launch re-review 2026-11-12.
+async function connected($) {
+  try { return Boolean((await troxyConfig($)).apiKey); } catch { return false; }
+}
+
 // Settings switches from dash.troxy.io (routing, compact_after_answer, idle_compact), brought
 // by the savings fetch after every answer and kept on disk. A missing one is on. The local
 // /troxy off and /troxy compact off still work on top, for this machine.
 async function switchedOff($, key) {
   try { const f = await $.store.get('features'); return Boolean(f && f[key] === false); } catch { return false; }
 }
+// Every lever off (launch re-review 2026-11-12). /troxy off (paused) and TROXY_OFF=1 (one process:
+// a script, a benchmark fork) stop routing, effort, subagent models, both compactions, masking,
+// keep-awake and the /clear hint. Usage reports still follow reportUsage, marked paused.
+async function allOff($) {
+  try { return (await $.env.get('TROXY_OFF')) === '1' || Boolean(await $.store.get('paused')); } catch { return false; }
+}
+// Scripts, CI jobs and Agent SDK apps (claude -p; isInteractive false at session.start) get no lever
+// at all: they asked for a model and a behavior on purpose, and nobody is there to see a change.
+let interactive = true;
+async function leversOff($) {
+  return !interactive || (await allOff($));
+}
 async function routingOff($) {
-  return Boolean(await $.store.get('paused')) || switchedOff($, 'routing');
+  return (await leversOff($)) || switchedOff($, 'routing');
+}
+// Troxy compacts only when nothing says no: not with every lever off, not with Claude Code's own
+// DISABLE_AUTO_COMPACT, and not with /troxy compact off. The Settings switches are checked where
+// each kind of compaction is decided (bigCompactOn, bigSession, idleCompact).
+async function compactBlocked($) {
+  if (await leversOff($)) return true;
+  if (['1', 'true'].includes(String((await $.env.get('DISABLE_AUTO_COMPACT')) || '').toLowerCase())) return true;
+  return Boolean(await $.store.get('compactOff'));
+}
+// After-answer compaction starts only from a finished answer: not from a turn the person interrupted
+// (Esc, usually to correct Claude) and not when a subagent finishes inside the turn.
+function afterAnswerAllowed(e) {
+  return !(e && (e.isAborted || e.agentId));
 }
 
 // No key yet: ask api.troxy.io for a code, show it, and poll until the person approves it on
 // dash.troxy.io/activate. The key then lands in ~/.troxy/config.json (0600), no copy-paste.
 let connecting = null;
+// A connect that cannot start says so (launch re-review 2026-11-12): before, no code and no error
+// showed, and /troxy status still said routing was on.
+async function connectFailed($, why) {
+  const msg = `Troxy: could not get a connect code (${why}). Type /troxy connect to try again.`;
+  try { $.ui.status(msg); } catch {}
+  try { await $.state.set(CONNECT, msg); } catch {}
+}
 async function connectDevice($) {
   if (connecting) return;
   if ((await troxyConfig($)).apiKey) { await $.state.set(CONNECT, null); return; }
@@ -245,9 +287,9 @@ async function connectDevice($) {
     const res = await troxyFetch($, 'https://api.troxy.io/device/start', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name: user ? `${user}'s Claude Code` : 'Claude Code' }) });
-    if (!res.ok) return;
+    if (!res.ok) { await connectFailed($, `the server answered ${res.status}`); return; }
     start = JSON.parse(res.text); // $.http.fetch gives text, no .json()
-  } catch { return; }
+  } catch { await connectFailed($, 'Troxy could not be reached'); return; }
   const link = `${start.verification_uri}?code=${start.user_code}`;
   const ask = `Connect Troxy: open ${link} and approve code ${start.user_code}`;
   $.ui.status(ask);
@@ -255,6 +297,15 @@ async function connectDevice($) {
   await $.state.set(CONNECT, ask);
   const until = Date.now() + start.expires_in * 1000;
   connecting = $.clock.every(Math.max(5, start.interval || 5) * 1000, async () => {
+    // Another open session on this machine was approved first: the key is in config.json, so this
+    // session is connected too. Before, it kept polling its own code and then said "expired".
+    if ((await troxyConfig($)).apiKey) {
+      connecting.cancel(); connecting = null;
+      $.ui.status(undefined);
+      await $.state.set(CONNECT, null);
+      $.ui.toast('Troxy is connected. It starts working on your next message.');
+      return;
+    }
     let body = null;
     try {
       const res = await troxyFetch($, 'https://api.troxy.io/device/poll', {
@@ -265,7 +316,7 @@ async function connectDevice($) {
     if (body.status === 'pending' && Date.now() < until) return;
     connecting.cancel(); connecting = null;
     if (body.status !== 'approved' || !body.key) {
-      const gone = 'Troxy: the connect code expired. Type /reload-plugins for a new one.';
+      const gone = 'Troxy: the connect code expired. Type /troxy connect for a new one.';
       $.ui.status(gone);
       await $.state.set(CONNECT, gone);
       return;
@@ -273,7 +324,8 @@ async function connectDevice($) {
     const path = `${home}/.troxy/config.json`;
     let cfg = {};
     try { cfg = JSON.parse(await $.fs.read(path)) || {}; } catch {}
-    await $.fs.write(path, JSON.stringify({ ...cfg, apiKey: body.key, agentName: body.name, reportUsage: true, viaProxy: false }, null, 2));
+    // reportUsage: a false the person set stays false (connecting is not consent to reporting again).
+    await $.fs.write(path, JSON.stringify({ ...cfg, apiKey: body.key, agentName: body.name, reportUsage: cfg.reportUsage !== false, viaProxy: false }, null, 2));
     try { await $.process.run(['chmod', '600', path]); } catch {} // fs.write cannot set a mode
     $.ui.status(undefined);
     await $.state.set(CONNECT, null);
@@ -311,7 +363,7 @@ const REPORT_KEEP_ROWS = 1000; // kept for the next try while Troxy is unreachab
 let pending = [];
 let compacting = false;
 
-function reportRow({ sid, usage, requested, arm, cold, score, compact, compactArm, rateLimits, ts, effort, effortAsked, surfaces, compressed, recalled, subArm, agentId, cut, cutArm, mask, clear }) {
+function reportRow({ sid, usage, requested, arm, cold, score, compact, compactArm, rateLimits, ts, effort, effortAsked, surfaces, compressed, recalled, subArm, agentId, cut, cutArm, mask, clear, paused, addonVersion, stretch }) {
   const rl = {};
   for (const w of rateLimits || []) {
     if (!WINDOW_LABEL[w.kind]) continue;
@@ -326,9 +378,16 @@ function reportRow({ sid, usage, requested, arm, cold, score, compact, compactAr
     rate_limits: rl, ts, effort: effort || null, effort_requested: effortAsked || null,
     compressed_tokens: compressed > 0 ? compressed : null,
     recalled_tokens: recalled > 0 ? recalled : null,
-    sub_arm: subArm || null, agent_id: agentId || null,
+    // subagent_id, not agent_id: audit_log.agent_id is a UUID column and a subagent id is not a UUID,
+    // so one subagent row could fail the whole report (launch re-review 2026-11-12).
+    sub_arm: subArm || null, subagent_id: agentId || null,
+    addon_version: addonVersion || null, // which add-on sent it: a version floor and support need it
+    // Troxy was off (/troxy off or TROXY_OFF=1): the backend never counts the row as treated.
+    ...(paused ? { paused: true } : {}),
     // Every lever follows the session arm since 1.41.0 (sessionArm); the keys stay so old rows still read.
-    levers: { mask_arm: arm || null, effort_arm: arm || null, clear_arm: arm || null, ...(clear || {}), ...(mask ? { mask } : {}), ...(cutArm ? { cut_arm: cutArm, cut } : {}) },
+    levers: { mask_arm: arm || null, effort_arm: arm || null, clear_arm: arm || null, ...(clear || {}), ...(mask ? { mask } : {}), ...(cutArm ? { cut_arm: cutArm, cut } : {}),
+      // The stretch the row belongs to (sessionArm), so the readout groups rows by stretch.
+      ...(stretch && stretch.id ? { stretch_id: stretch.id, prev_arm: stretch.prev || null, ctx_at_draw: stretch.ctx == null ? null : stretch.ctx, prompt_n: stretch.n || 0 } : {}) },
     surface: (surfaces || []).includes('desktop') ? 'desktop' : (surfaces || []).includes('terminal') ? 'terminal' : null,
   };
 }
@@ -352,6 +411,18 @@ async function compressedSince($, sid, dir = 'saved') {
 }
 const recalledSince = ($, sid) => compressedSince($, sid, 'recalled');
 
+// The add-on's own version (.claude-plugin/plugin.json), read once per process, for every report row.
+let addonVersion;
+async function addonVersionOf($) {
+  if (addonVersion === undefined) {
+    try { addonVersion = JSON.parse(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`)).version || null; } catch { addonVersion = null; }
+  }
+  return addonVersion;
+}
+async function stretchOf($, sid) {
+  try { return (await $.store.get(`stretch:${sid}`)) || null; } catch { return null; }
+}
+
 async function noteStep($, result, meta) {
   const usage = result && result.usage;
   if (!usage || !usage.model) return;
@@ -362,7 +433,8 @@ async function noteStep($, result, meta) {
   const sid = await $.session.id();
   const mask = lastMask; lastMask = null;
   const clear = await clearFlags($, sid, await $.clock.now());
-  pending.push(reportRow({ ...meta, mask, clear, sid, usage, compact: compacting, compactArm: meta.arm, rateLimits, surfaces, compressed: await compressedSince($, sid), recalled: await recalledSince($, sid), ts: await $.clock.now() }));
+  const addonVersion = await addonVersionOf($), stretch = await stretchOf($, sid);
+  pending.push(reportRow({ ...meta, mask, clear, addonVersion, stretch, sid, usage, compact: compacting, compactArm: meta.arm, rateLimits, surfaces, compressed: await compressedSince($, sid), recalled: await recalledSince($, sid), ts: await $.clock.now() }));
   if (pending.length > REPORT_KEEP_ROWS) pending = pending.slice(-REPORT_KEEP_ROWS);
 }
 
@@ -397,8 +469,9 @@ async function flushReport($) {
 }
 
 // /troxy status: everything about this session's Troxy in one place.
-function statusText({ version, paused, savings, rateLimits = [], compactOff = false, settingsOff = [] }) {
-  const lines = [`Troxy ${version || ''}`.trim() + ` · routing is ${paused ? 'off' : 'on'}`];
+function statusText({ version, paused, allPaused = false, savings, rateLimits = [], compactOff = false, settingsOff = [] }) {
+  const lines = [`Troxy ${version || ''}`.trim() + (allPaused ? ' · off on this machine' : ` · routing is ${paused ? 'off' : 'on'}`)];
+  if (allPaused) lines.push('Everything is paused: no model, effort or subagent changes, no compaction, nothing kept awake.');
   lines.push(`This session: ${savings || 'nothing moved to a lighter model yet'}`);
   const meter = rateLimits.filter(w => WINDOW_LABEL[w.kind]).map(w => `${WINDOW_LABEL[w.kind]} ${Math.round(w.percentUsed)}%`);
   if (meter.length) lines.push(`Plan usage now: ${meter.join(' · ')}`);
@@ -407,7 +480,7 @@ function statusText({ version, paused, savings, rateLimits = [], compactOff = fa
     : `Idle compaction is on: sessions over ${COMPACT_MIN_TOKENS / 1000}k tokens are compacted after ${COMPACT_IDLE_MS / 60000} min idle (/troxy compact off).`);
   if (settingsOff.length) lines.push(`Turned off in Settings on dash.troxy.io: ${settingsOff.join(', ')}.`);
   lines.push('All sessions and the on/off switches: dash.troxy.io');
-  lines.push(paused ? 'Type /troxy on to resume.' : 'Type /troxy off to pause routing.');
+  lines.push(paused || allPaused ? 'Type /troxy on to resume.' : 'Type /troxy off to pause everything.');
   return lines.join('\n');
 }
 
@@ -466,6 +539,9 @@ function afterTurnDelay({ tokens, on, off }) {
   return on && !off && tokens >= BIG_COMPACT_TOKENS ? BIG_COMPACT_DELAY_MS : COMPACT_IDLE_MS;
 }
 async function bigCompactOn($) {
+  // Never before connect (connected), and not in a stretch that began at first sight (routeStep):
+  // a session Troxy has just met is not compacted right after an answer. Its next idle-cold moment decides.
+  if (!(await connected($)) || (await firstSightStretch($)) || (await compactBlocked($))) return false;
   const pin = await $.env.get('TROXY_BIG_COMPACT');
   if (pin === '1' || pin === '0') return pin === '1';
   return !(await switchedOff($, 'compact_after_answer')) && !(await compactHoldout($));
@@ -529,7 +605,7 @@ function stopAwake() {
 }
 
 async function bigSession($) {
-  if ((await $.store.get('compactOff')) || (await switchedOff($, 'idle_compact')) || (await compactHoldout($))) return false;
+  if (!(await connected($)) || (await compactBlocked($)) || (await switchedOff($, 'idle_compact')) || (await compactHoldout($))) return false;
   const u = await $.session.usage();
   return ((u.context && u.context.tokens) || 0) >= COMPACT_MIN_TOKENS;
 }
@@ -537,8 +613,9 @@ async function bigSession($) {
 // late: the user is back after a long idle (the Mac may have slept through the timer),
 // so compact now or not at all: never hold their prompt waiting for a meter reset.
 async function idleCompact($, { late = false, afterAnswer = false } = {}) {
+  if (!(await connected($))) return; // not connected yet: Troxy never compacts
   const u = await $.session.usage();
-  const off = Boolean(await $.store.get('compactOff')) || await switchedOff($, afterAnswer ? 'compact_after_answer' : 'idle_compact')
+  const off = (await compactBlocked($)) || await switchedOff($, afterAnswer ? 'compact_after_answer' : 'idle_compact')
     || (!(await $.env.get('TROXY_BIG_COMPACT')) && await compactHoldout($));
   const plan = compactPlan({ tokens: u.context && u.context.tokens, rateLimits: u.rateLimits, now: await $.clock.now(), off });
   if (plan.action === 'wait' && !late) return armCompact($, plan.inMs, { afterAnswer });
@@ -575,11 +652,15 @@ let decision = null;
 // Lever 5: back after a long break, the old context may be for another task. Say
 // once per session that /clear starts fresh; never clear. Treated stretches see
 // it (sessionArm), so its effect on the bar can be measured.
+// Off by default (decided 2026-11-12: Troxy gives no /clear or new-session advice; it is for
+// people who never restart a session). TROXY_CLEAR_HINT=1 turns it on, for an A/B run.
 // ponytail: no topic check, the gap alone triggers it; add one if users find it noisy.
 const CLEAR_HINT_GAP_MS = 60 * 60 * 1000;
 const CLEAR_HINT_MIN_TOKENS = 30000;
 async function clearHint($, sid, gapMs) {
-  if ((await sessionArm($, sid)) !== 'treated' || (await $.env.get('TROXY_CLEAR_HINT')) === '0') return false;
+  // The arm is asked first even when the hint is off: on a returning prompt this is where the new
+  // stretch's arm is drawn when idle compaction did not draw it (sessionArm).
+  if ((await sessionArm($, sid)) !== 'treated' || (await leversOff($)) || (await $.env.get('TROXY_CLEAR_HINT')) !== '1') return false;
   if (await $.store.get(`clear_hint:${sid}`)) return false;
   const u = await $.session.usage();
   const tokens = (u.context && u.context.tokens) || 0;
@@ -606,8 +687,10 @@ async function clearFlags($, sid, now) {
   return out;
 }
 
+let promptPending = false; // a person's prompt started; routeStep counts it in its stretch
 async function scorePrompt($, e, next) {
   decision = null;
+  promptPending = true;
   cancelCompact();
   const sid = await $.session.id();
   // Idle past the timer by the wall clock: a sleeping Mac freezes the timer and a restart
@@ -624,12 +707,15 @@ async function scorePrompt($, e, next) {
   if (idleSince != null && now - idleSince >= COMPACT_IDLE_MS) {
     try { await idleCompact($, { late: true }); } catch {} // fail open: send the prompt as-is
   }
-  if (ls && now - ls.at >= CLEAR_HINT_GAP_MS) try { await clearHint($, sid, now - ls.at); } catch {}
+  // Not connected yet: no /clear hint (nor its arm draw) and no scorer call; idleCompact checks too.
+  const on = await connected($);
+  if (on) try { const { value: c } = await $.state.get(CONNECT); if (c) await $.state.set(CONNECT, null); } catch {}
+  if (on && ls && now - ls.at >= CLEAR_HINT_GAP_MS) try { await clearHint($, sid, now - ls.at); } catch {}
   turn = { start: await snapshot($), ratio: 1 };
   const file = modRouteFile($.plugin.root, sid);
   if (file && lastNote !== `${sid}:{}`) { lastNote = `${sid}:{}`; await $.fs.write(file, '{}'); } // clear the previous prompt's note
   if (REGRET_TEXT.test(String(e.text || ''))) { try { await noteRegret($, sid); } catch {} }
-  if (await routingOff($)) return next(e);
+  if (!on || (await routingOff($))) return next(e);
   const kind = e.origin && e.origin.kind;
   // Scripts, CI jobs and Agent SDK runs ('sdk') keep the model they asked for.
   if (kind !== 'composer' && kind !== 'bridge') return next(e);
@@ -666,6 +752,10 @@ async function lastSentFor($, sid) {
   }
   return lastSent.get(sid);
 }
+// True while this session is in a stretch that began at first sight (routeStep marks the record).
+async function firstSightStretch($) {
+  try { const ls = await lastSentFor($, await $.session.id()); return Boolean(ls && ls.firstSight); } catch { return false; }
+}
 const WARM_MS = 55 * 60 * 1000;
 // Sessions whose next step is a cold moment because the conversation was just compacted.
 const coldNext = new Set();
@@ -690,14 +780,22 @@ async function sessionArm($, sid) {
   try { arm = await $.store.get(`arm:${sid}`); at = await $.store.get(`arm_at:${sid}`); } catch {}
   const drawnThisGap = typeof at === 'number' && (!ls || at > ls.at);
   if ((arm === 'holdout' || arm === 'treated') && (drawnThisGap || (ls && now - ls.at < WARM_MS))) return arm;
+  const prevArm = arm === 'holdout' || arm === 'treated' ? arm : null;
   arm = Math.random() < holdoutDraw.fraction ? 'holdout' : 'treated';
   try { await $.store.set(`arm:${sid}`, arm); await $.store.set(`arm_at:${sid}`, now); } catch {}
+  // The stretch this draw starts, for the report rows: an id, the arm before it, the context it
+  // inherits and a prompt counter (routeStep counts), so the readout can group rows by stretch and
+  // check for carryover instead of guessing stretches from time gaps (launch re-review 2026-11-12).
+  let ctx = null;
+  try { ctx = ((((await $.session.usage()).context) || {}).tokens) || 0; } catch {}
+  const id = `${String(sid).replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 60)}:${now}`;
+  try { await $.store.set(`stretch:${sid}`, { id, prev: prevArm, ctx, n: 0 }); } catch {}
   return arm;
 }
 // The model the user asked for and the one that ran, per session, kept across restarts.
 // The transcript records only the model that ran, so `claude --resume` reopens a routed
 // session on Haiku; without this the mod would take Haiku as the user's pick for good.
-// ponytail: a /model to the same model already showing is invisible, so it stays mapped.
+// A typed /model to the model already showing is invisible here; pinModel catches it.
 const asked = new Map();
 async function askedFor($, sid, model, switched) {
   if (switched) asked.set(sid, null);
@@ -730,17 +828,32 @@ function stepModel({ arm, requested, switched, cold, score, warm, haiku = false,
 // per message, which keeps the prompt cache (tested 2026-10-20: about 65 cache tokens
 // written on a changed turn, same as an unchanged one). The 10-20 A/B with a low
 // band took more steps, so the floor is now medium (launch review lever 3: never
-// below medium). On in treated stretches (sessionArm); TROXY_EFFORT_SWAP=0 turns it off.
+// below medium).
+// Off by default since the 2026-11-12 launch re-review: it lowered an effort the user chose,
+// silently, and it has no measured result of its own yet. TROXY_EFFORT_SWAP=1 turns it on, in
+// treated stretches (sessionArm). Even then it never lowers a level above the model's default:
+// e.effort is the user's setting or the model's default, so a level above the default can only
+// be the user's choice. The band says "effort medium" whenever it lowers one.
 const EFFORT_RANK = { low: 0, medium: 1, high: 2, xhigh: 3, max: 4 };
 const EFFORT_MEDIUM_BELOW = 0.85;
-function stepEffort({ arm, requested, score, on }) {
+// Each model's default effort in Claude Code (the 5.5 models all default to medium, per the
+// model-config docs). A model not listed here is never lowered. ponytail: with every default at
+// medium, the floor, the swap lowers nothing on today's models; it needs its redesign first.
+const EFFORT_DEFAULT = { haiku: 'medium', sonnet: 'medium', opus: 'medium' };
+function stepEffort({ arm, requested, score, on, model }) {
   if (!on || arm !== 'treated' || score == null || !(requested in EFFORT_RANK)) return requested;
+  const dflt = EFFORT_DEFAULT[tierOf(model)];
+  if (!dflt || EFFORT_RANK[requested] > EFFORT_RANK[dflt]) return requested; // the user's own choice: kept
   const cap = score < EFFORT_MEDIUM_BELOW ? 'medium' : null;
   return cap && EFFORT_RANK[cap] < EFFORT_RANK[requested] ? cap : requested;
 }
-// On in treated stretches (stepEffort checks the arm); TROXY_EFFORT_SWAP=0 turns it off.
+// Off unless TROXY_EFFORT_SWAP=1; stepEffort also checks the arm.
 async function effortSwapOn($) {
-  return (await $.env.get('TROXY_EFFORT_SWAP')) !== '0';
+  return (await $.env.get('TROXY_EFFORT_SWAP')) === '1';
+}
+// The band's note when the effort swap lowered this step's effort, so it is never silent.
+function effortText(asked, sent) {
+  return typeof sent === 'string' && typeof asked === 'string' && sent !== asked ? `effort ${sent}` : null;
 }
 
 async function haikuBandOn($) {
@@ -763,7 +876,7 @@ function subagentTarget({ arm, subagentType, model, fork, isTeammate, parentMode
 }
 async function routeSpawn($, e, next) {
   let arm = null, off = true;
-  try { arm = await $.store.get(`arm:${await $.session.id()}`); off = await routingOff($); } catch {}
+  try { arm = await $.store.get(`arm:${await $.session.id()}`); off = !(await connected($)) || await routingOff($); } catch {}
   const target = off ? null : subagentTarget({ ...e, arm });
   if (!target) return next(e);
   const r = await next({ ...e, model: target });
@@ -798,13 +911,25 @@ async function cutFor($, arm) {
 }
 
 // Stub old tool output before compacting (launch review lever 4). Most of a big session is
-// old tool output the next task never reads again, so it is cut to a one-line stub with no
-// model call; only if the session is still big after that does the summarizer run, over the
+// old tool output the next task never reads again, so it is cut to its head and a one-line note
+// with no model call; only if the session is still big after that does the summarizer run, over the
 // smaller text. Troxy's own compactions only (trigger plugin), main loop, treated stretches.
 const MASK_KEEP_RECENT = 12; // messages at the end kept whole, with their engine handles
 const MASK_MIN_CHARS = 400; // a result shorter than this is kept
 const MASK_ENOUGH_TOKENS = 60000; // after stubbing, at or under this: no summary needed
-const stub = (tool) => `[${tool || 'tool'} output removed by Troxy to save space; run it again if it is needed]`;
+// The stub keeps the head of the output (ids, URLs and the first error usually sit there) and
+// never tells Claude to run the tool again: a stubbed Bash or MCP call can be a deploy or a
+// migration, and in auto-accept mode a re-run needs no approval (launch re-review 2026-11-12).
+const MASK_HEAD_CHARS = 200;
+// Bash output up to this size stays whole (about 500 tokens): cheap to keep, and it is where a
+// deploy, a migration or a test run says what happened.
+const MASK_BASH_WHOLE_CHARS = 2000;
+const stub = (tool, text) => `${String(text || '').slice(0, MASK_HEAD_CHARS)}\n[${tool || 'tool'} output shortened by Troxy to save space. `
+  + `First ${MASK_HEAD_CHARS} characters kept above. Re-run only if the command is read-only; otherwise ask the user.]`;
+function stubbable(tool, text) {
+  const n = String(text || '').length;
+  return n >= MASK_MIN_CHARS && !(tool === 'Bash' && n <= MASK_BASH_WHOLE_CHARS);
+}
 function stubInput(input) {
   const out = {};
   for (const [k, v] of Object.entries(input || {})) {
@@ -819,23 +944,23 @@ function maskMessages(messages) {
   let removed = 0;
   const out = messages.map((m, i) => {
     if (i >= cut) return m;
-    const big = (m.toolResults || []).some(r => String(r.text || '').length >= MASK_MIN_CHARS)
-      || (m.toolUses || []).some(u => String(u.text || '').length >= MASK_MIN_CHARS || JSON.stringify(u.input || {}).length > 2000);
+    const big = (m.toolResults || []).some(r => stubbable(toolOf.get(r.tool_use_id), r.text))
+      || (m.toolUses || []).some(u => stubbable(u.tool, u.text) || JSON.stringify(u.input || {}).length > 2000);
     if (!big) return m;
     const { handle, ...rest } = m;
     return {
       ...rest,
       toolUses: (m.toolUses || []).map(u => {
-        const long = String(u.text || '').length >= MASK_MIN_CHARS;
-        if (long) removed += String(u.text).length;
+        const long = stubbable(u.tool, u.text);
+        if (long) removed += String(u.text).length - MASK_HEAD_CHARS;
         const { result, ...k } = u;
-        return { ...k, input: stubInput(u.input), ...(u.text === undefined ? {} : { text: long ? stub(u.tool) : u.text }) };
+        return { ...k, input: stubInput(u.input), ...(u.text === undefined ? {} : { text: long ? stub(u.tool, u.text) : u.text }) };
       }),
       ...(m.toolResults ? { toolResults: m.toolResults.map(r => {
-        const long = String(r.text || '').length >= MASK_MIN_CHARS;
-        if (long) removed += String(r.text).length;
+        const long = stubbable(toolOf.get(r.tool_use_id), r.text);
+        if (long) removed += String(r.text).length - MASK_HEAD_CHARS;
         const { result, meta, ...k } = r;
-        return long ? { ...k, text: stub(toolOf.get(r.tool_use_id)) } : k;
+        return long ? { ...k, text: stub(toolOf.get(r.tool_use_id), r.text) } : k;
       }) } : {}),
     };
   });
@@ -852,7 +977,7 @@ function messagesTokens(messages) {
 }
 let lastMask = null; // what the last compaction did, for the report row: 'stub' | 'stub+summary' | null
 async function maskCompact($, e, next) {
-  if (e.trigger !== 'plugin' || e.agentId || !Array.isArray(e.messages)) return next(e);
+  if (e.trigger !== 'plugin' || e.agentId || !Array.isArray(e.messages) || !(await connected($)) || (await leversOff($))) return next(e);
   const sid = await $.session.id();
   if ((await sessionArm($, sid)) !== 'treated' || (await $.env.get('TROXY_MASK')) === '0') return next(e);
   const before = messagesTokens(e.messages);
@@ -867,54 +992,108 @@ async function maskCompact($, e, next) {
   return next({ ...e, messages });
 }
 
-// Warn before a /model switch drops a warm cache (launch review lever 7): the next step on
-// the new model re-sends the whole conversation at full price. Asks once; the same /model
-// again within 2 minutes goes through. /model with no model named opens the picker: let it.
-const MODEL_WARN_MIN_TOKENS = 50000;
-const MODEL_WARN_AGAIN_MS = 2 * 60 * 1000;
-const modelWarned = new Map(); // sid -> { tier, at }
-async function warnModelSwitch($, e, next) {
-  const want = tierOf(e.args);
-  if (!want) return next(e);
-  const sid = await $.session.id();
-  const now = await $.clock.now();
-  const ls = await lastSentFor($, sid);
-  const tokens = (((await $.session.usage()).context || {}).tokens) || 0;
-  const warmOn = ls && now - ls.at < WARM_MS ? tierOf(ls.model) : null;
-  const w = modelWarned.get(sid);
-  if (!warmOn || warmOn === want || tokens < MODEL_WARN_MIN_TOKENS || (w && w.tier === want && now - w.at < MODEL_WARN_AGAIN_MS)) {
-    modelWarned.delete(sid);
-    if (warmOn && warmOn !== want && lastRouted.get(sid) && RANK[want] > RANK[warmOn]) await noteRegret($, sid).catch(() => false);
-    return next(e);
+// /model wins (launch re-review 2026-11-12). A typed /model names the model the person wants now,
+// even when it is the one Claude Code already shows (Troxy may have moved the session to a lighter
+// one, which Claude Code does not see). The session then runs on what Claude Code asks for until its
+// next cold moment, when Troxy may pick again. No warning of Troxy's own any more: Claude Code itself
+// confirms a model switch on a warm cache, and asking twice blocked /model once even with Troxy off.
+// A /model back up from a model Troxy picked counts as a regret for the per-user cut.
+const pins = new Map(); // sid -> { at } or null; on disk as pin:<sid> for a resume or restart
+async function pinFor($, sid) {
+  if (!pins.has(sid)) {
+    let v = null;
+    try { v = (await $.store.get(`pin:${sid}`)) || null; } catch {}
+    pins.set(sid, v);
   }
-  modelWarned.set(sid, { tier: want, at: now });
-  return { text: `Troxy: this session's cache is warm on ${warmOn}. Switching to ${want} now re-sends about ${Math.round(tokens / 1000)}k tokens at full price on the next step. Run /model ${String(e.args).trim()} again within 2 minutes to switch anyway.` };
+  return pins.get(sid);
+}
+async function pinModel($, e, next) {
+  try {
+    const want = tierOf(e.args);
+    if (want) {
+      const sid = await $.session.id();
+      const at = await $.clock.now();
+      pins.set(sid, { at });
+      try { await $.store.set(`pin:${sid}`, { at }); } catch {}
+      const ls = await lastSentFor($, sid);
+      if (ls && lastRouted.get(sid) && RANK[want] > RANK[tierOf(ls.model)]) await noteRegret($, sid).catch(() => false);
+    }
+  } catch {} // a missed pin only means Troxy keeps the warm model until the next cold moment
+  return next(e);
+}
+
+// Troxy's own compaction (idleCompact) makes its summary call through turn.step too. It goes out on
+// the model the cache is warm on, at the effort asked for: the idle timer fires at 55 min, inside the
+// 1h cache, and a cold re-pick from the last prompt's score could move it to a model with no cache
+// and re-read 100-200k tokens at full price (launch re-review 2026-11-12). It is not a user step, so
+// it leaves the warm clock, the route note, /model detection and the regret count alone: moving
+// lastSent here made the next stretch draw its arm a second time after a long absence.
+async function* compactionStep($, e, next, sid, ls) {
+  const arm = await sessionArm($, sid); // the stretch this compaction serves (idleCompact drew it)
+  const want = await askedFor($, sid, e.model, false);
+  const model = (ls && ls.model) || e.model; // no record: the request as Claude Code made it
+  const result = yield* next(model === e.model ? e : { ...e, model });
+  try { await noteStep($, result, { requested: want, arm, cold: false, score: null, effort: e.effort, effortAsked: e.effort }); } catch {}
+  return result;
 }
 
 async function* routeStep($, e, next) {
+  // Not connected yet: the step goes out as Claude Code made it, and nothing is recorded, so the
+  // first step after connecting is a first sight (or a new session's first step) as usual.
+  if (!(await connected($))) return yield* next(e);
+  // A script, CI job or Agent SDK run: sent as Claude Code made it, no arm drawn, reported with no
+  // arm so it never enters the treated vs holdout comparison (launch re-review 2026-11-12).
+  if (!interactive) {
+    const result = yield* next(e);
+    try { await noteStep($, result, { requested: e.model, arm: null, cold: false, score: null, effort: e.effort, effortAsked: e.effort, agentId: e.agentId }); } catch {}
+    return result;
+  }
   // A subagent keeps the model it was spawned with (routeSpawn picked it, if anyone did).
   if (e.agentId) {
     const result = yield* next(e);
     const sub = subAgents.get(e.agentId);
-    try { await noteStep($, result, { requested: sub ? sub.asked : e.model, arm: await $.store.get(`arm:${await $.session.id()}`), cold: false, subArm: sub && sub.subArm, agentId: e.agentId }); } catch {}
+    try { await noteStep($, result, { requested: sub ? sub.asked : e.model, arm: await $.store.get(`arm:${await $.session.id()}`), cold: false, subArm: sub && sub.subArm, agentId: e.agentId, paused: await allOff($) }); } catch {}
     return result;
   }
   const sid = await $.session.id();
   const now = await $.clock.now();
   const ls = await lastSentFor($, sid);
-  const isCold = !ls || now - ls.at >= WARM_MS || coldNext.has(sid);
+  if (compacting) return yield* compactionStep($, e, next, sid, ls);
+  // First sight: no record of this session, yet it already has context (installed mid-session, or a
+  // session from before the install). Its cache is warm on the model it asks for, so that model is
+  // recorded as warm instead of a cold pick at zero context, which moved a 300k Opus session to
+  // Sonnet on its first message (launch re-review 2026-11-12). A brand-new session has no context
+  // figure until its first answer, so its first step is still picked as before.
+  let firstSight = false;
+  if (!ls) try { firstSight = ((((await $.session.usage()).context) || {}).tokens || 0) > 0; } catch {}
+  const isCold = !firstSight && (!ls || now - ls.at >= WARM_MS || coldNext.has(sid));
+  // A stretch that began at first sight goes out as Claude Code set it (model and effort, and no
+  // compaction right after an answer: bigCompactOn) until its next cold moment.
+  // A /model pin (pinModel) holds until the first cold moment after it.
+  let pinned = Boolean(await pinFor($, sid));
+  if (pinned && isCold && ls && ls.at > pins.get(sid).at) {
+    pinned = false;
+    pins.set(sid, null);
+    try { await $.store.set(`pin:${sid}`, null); } catch {}
+  }
+  const hold = firstSight || pinned || (!isCold && Boolean(ls && ls.firstSight));
   const arm = await sessionArm($, sid);
+  const paused = await allOff($);
+  if (promptPending) {
+    promptPending = false;
+    try { const s = await $.store.get(`stretch:${sid}`); if (s) await $.store.set(`stretch:${sid}`, { ...s, n: (s.n || 0) + 1 }); } catch {}
+  }
   await $.state.set(ARM, arm);
   const prev = lastAsked.get(sid);
   lastAsked.set(sid, e.model);
   const switched = Boolean(prev && prev !== e.model);
   const want = await askedFor($, sid, e.model, switched);
   // A /model back up from a model Troxy picked is a regret (the picker path; a typed
-  // /model was counted in warnModelSwitch, which cleared lastRouted).
+  // /model was counted in pinModel, which cleared lastRouted).
   if (switched && ls && RANK[tierOf(e.model)] > RANK[tierOf(ls.model)]) try { await noteRegret($, sid); } catch {}
   let cut = BANDS[0][0], cutArm = null;
   try { ({ cut, cutArm } = await cutFor($, arm)); } catch {}
-  const model = (await routingOff($)) ? want : stepModel({
+  const model = hold ? e.model : (await routingOff($)) ? want : stepModel({
     arm, requested: want, switched,
     cold: isCold,
     score: decision ? decision.score : null, warm: ls && ls.model,
@@ -928,8 +1107,9 @@ async function* routeStep($, e, next) {
     try { const r = (await $.store.get('regret')) || { routed: 0, regret: 0 }; await $.store.set('regret', { ...r, routed: r.routed + 1 }); } catch {}
   }
   coldNext.delete(sid);
-  lastSent.set(sid, { model, at: now });
-  try { await $.store.set(`sent:${sid}`, { model, at: now }); } catch {} // a missed write only makes the next process cold
+  const rec = firstSight || (hold && !pinned) ? { model, at: now, firstSight: true } : { model, at: now };
+  lastSent.set(sid, rec);
+  try { await $.store.set(`sent:${sid}`, rec); } catch {} // a missed write only makes the next process cold
   // The daemon tags every call with the arm, plus from/to when the model changed.
   const file = modRouteFile($.plugin.root, sid);
   const key = `${sid}:${arm}:${want}>${model}`;
@@ -939,23 +1119,24 @@ async function* routeStep($, e, next) {
     await $.fs.write(file, JSON.stringify(route));
   }
   try { await rememberAsked($, sid, want, model); } catch {} // a missed write only loses this on resume
-  const rt = routeText(want, model);
+  let effort = e.effort;
+  if (!hold && !(await routingOff($))) {
+    try { effort = stepEffort({ arm, requested: e.effort, score: decision ? decision.score : null, on: await effortSwapOn($), model: want }); } catch {}
+  }
+  const rt = [routeText(want, model), effortText(e.effort, effort)].filter(Boolean).join(' · ') || null;
   if (rt !== lastRouteText) { lastRouteText = rt; try { await $.state.set(ROUTE, rt); } catch {} }
   if (model !== want && turn) turn.ratio = PRICE[tierOf(want)] / PRICE[tierOf(model)];
-  let effort = e.effort;
-  if (!(await routingOff($))) {
-    try { effort = stepEffort({ arm, requested: e.effort, score: decision ? decision.score : null, on: await effortSwapOn($) }); } catch {}
-  }
   const sent = model === e.model && effort === e.effort ? e : { ...e, model, ...(effort === undefined ? {} : { effort }) };
   const result = yield* next(sent);
-  try { await noteStep($, result, { requested: want, arm, cold: isCold, score: decision ? decision.score : null, effort: sent.effort, effortAsked: e.effort, cut, cutArm }); } catch {} // a missed row only thins the dashboard
+  try { await noteStep($, result, { requested: want, arm, cold: isCold, score: decision ? decision.score : null, effort: sent.effort, effortAsked: e.effort, cut, cutArm, paused }); } catch {} // a missed row only thins the dashboard
   return result;
 }
 
 export function register(on) {
   on('tool.call', { tool: 'Bash' }, guardBash).catch(failClosed);
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'troxy', description: 'Pause or resume Troxy model routing', argumentHint: '[on|off|status]' });
+    interactive = e.isInteractive !== false; // claude -p and Agent SDK runs: false (leversOff)
+    await $.command.register({ name: 'troxy', description: 'Troxy: status, pause or resume, connect this machine', argumentHint: '[status|on|off|connect|compact on|compact off]' });
     // A resumed session would otherwise inherit its last routing note, and its background
     // calls before the next prompt would show as savings on the dashboard.
     const sid = await $.session.id();
@@ -972,8 +1153,17 @@ export function register(on) {
       await $.store.set('compactOff', c[1].toLowerCase() === 'off');
       return { text: c[1].toLowerCase() === 'off' ? 'Troxy idle compaction is off.' : 'Troxy idle compaction is on.' };
     }
+    // /troxy connect: a fresh code mid-session (the old advice, /reload-plugins, did not show one).
+    if (/^\s*connect\s*$/i.test(String(e.args || ''))) {
+      if (await connected($)) return { text: 'Troxy is already connected on this machine.' };
+      if (connecting) { connecting.cancel(); connecting = null; }
+      await connectDevice($);
+      const { value: c } = await $.state.get(CONNECT);
+      return { text: c || 'Troxy: no connect code yet. Try /troxy connect again in a minute.' };
+    }
     const r = troxyCommand(e.args, Boolean(await $.store.get('paused')));
     await $.store.set('paused', r.paused);
+    if (r.paused) cancelCompact(); // a compaction already waiting does not run either
     if (/^\s*(on|off)\s*$/i.test(String(e.args || ''))) return { text: r.text };
     const manifest = JSON.parse(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`).catch(() => '{}'));
     const settingsOff = [];
@@ -982,13 +1172,13 @@ export function register(on) {
     }
     const { value: connect } = await $.state.get(CONNECT);
     if (connect) return { text: connect };
-    return { text: statusText({ version: manifest.version, paused: r.paused || await switchedOff($, 'routing'), savings: (await $.state.get(SAVINGS)).value, rateLimits: (await $.session.usage()).rateLimits,
+    return { text: statusText({ version: manifest.version, paused: r.paused || await switchedOff($, 'routing'), allPaused: await allOff($), savings: (await $.state.get(SAVINGS)).value, rateLimits: (await $.session.usage()).rateLimits,
       compactOff: Boolean(await $.store.get('compactOff')) || await switchedOff($, 'idle_compact'), settingsOff }) };
   });
   // Routing fails open: a scorer or hook error must never break the session,
   // it just means the requested model is used as-is.
   on('prompt.submit', scorePrompt).catch(($, e, next) => { decision = null; return next(e); });
-  on('command.run', { command: 'model' }, warnModelSwitch).catch(async ($, e, next) => next(e));
+  on('command.run', { command: 'model' }, pinModel).catch(async ($, e, next) => next(e));
   on('command.run', { command: 'rewind' }, async ($, e, next) => { try { await noteRegret($, await $.session.id()); } catch {} return next(e); });
   on('session.compact', async ($, e, next) => {
     let r;
@@ -1018,6 +1208,7 @@ export function register(on) {
   // After the answer, so counting never delays a prompt.
   on('turn.complete', async ($, e, next) => {
     const r = await next(e);
+    if (e.agentId) return r; // a subagent finishing is not the end of the person's turn
     try { await flushReport($); } catch {} // unsent rows wait for the next turn
     let savings = null;
     try {
@@ -1040,7 +1231,7 @@ export function register(on) {
     try { stayAwake = await bigSession($); } catch {}
     try {
       delay = afterTurnDelay({ tokens: ((await $.session.usage()).context || {}).tokens || 0,
-        on: await bigCompactOn($), off: await $.store.get('compactOff') });
+        on: afterAnswerAllowed(e) && await bigCompactOn($), off: await $.store.get('compactOff') });
     } catch {}
     armCompact($, delay, { stayAwake: stayAwake && delay === COMPACT_IDLE_MS, persist: true, afterAnswer: delay !== COMPACT_IDLE_MS });
     return r;
@@ -1048,4 +1239,4 @@ export function register(on) {
 }
 
 // Exported for tests only - not part of the mod's runtime contract.
-export const _internal = { holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, warnModelSwitch, modelWarned, subAgents, stepModel, lastSent };
+export const _internal = { holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
