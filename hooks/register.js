@@ -266,6 +266,49 @@ function afterAnswerAllowed(e) {
   return !(e && (e.isAborted || e.agentId));
 }
 
+// Short answers, on by default (2026-11-15). What Claude writes is a small share of the tokens but
+// the most expensive kind, so new sessions get two lines in the system prompt asking for concise
+// output: the same style `troxy init` offers to write into CLAUDE.md, for people who installed
+// with /plugin and were never asked. /troxy concise off turns it off; /troxy off and scripts get
+// none of it; a machine whose CLAUDE.md already has the block is left alone (never said twice).
+// Decided once per session, at its first prompt render, then kept. The system prompt is the start
+// of the cache, so changing it in a session under way would re-send the whole conversation at
+// full price: /troxy concise on|off applies to sessions started after it, and a session that was
+// already running when this add-on first loaded keeps its prompt as it was.
+// ponytail: the same in every stretch of a session, so it does not skew the treated-vs-holdout
+// comparison, but its own effect is not measured. Tie it to the stretch arm (flip only at a cold
+// moment) when a number is needed.
+const CONCISE = { id: 'troxy-guard:concise', scope: 'session',
+  text: '## Output style (via Troxy)\n\n- Thorough in reasoning, concise in output.\n- No openers or closing fluff.' };
+const conciseBySession = new Map(); // sid -> boolean, on disk as concise:<sid>
+async function conciseInClaudeMd($) {
+  try { return (await $.fs.read(`${await $.env.get('HOME')}/.claude/CLAUDE.md`)).includes('troxy:concise:start'); } catch { return false; }
+}
+async function conciseOn($) {
+  const sid = await $.session.id();
+  if (conciseBySession.has(sid)) return conciseBySession.get(sid);
+  let on = null;
+  try { on = await $.store.get(`concise:${sid}`); } catch {}
+  if (typeof on !== 'boolean') {
+    on = false;
+    try {
+      const underWay = ((((await $.session.usage()).context) || {}).tokens || 0) > 0;
+      on = !underWay && (await connected($)) && !(await leversOff($)) && !(await $.store.get('conciseOff')) && !(await conciseInClaudeMd($));
+    } catch {}
+    try { await $.store.set(`concise:${sid}`, on); } catch {}
+  }
+  conciseBySession.set(sid, on);
+  return on;
+}
+// Fails open: any error leaves the prompt exactly as Claude Code composed it.
+async function composeConcise($, e, next) {
+  const r = await next(e);
+  try {
+    if (!r || !Array.isArray(r.sections) || (e.traits || []).includes('bare') || !(await conciseOn($))) return r;
+    return { ...r, sections: [...r.sections, CONCISE] };
+  } catch { return r; }
+}
+
 // No key yet: ask api.troxy.io for a code, show it, and poll until the person approves it on
 // dash.troxy.io/activate. The key then lands in ~/.troxy/config.json (0600), no copy-paste.
 let connecting = null;
@@ -469,7 +512,7 @@ async function flushReport($) {
 }
 
 // /troxy status: everything about this session's Troxy in one place.
-function statusText({ version, paused, allPaused = false, savings, rateLimits = [], compactOff = false, settingsOff = [] }) {
+function statusText({ version, paused, allPaused = false, savings, rateLimits = [], compactOff = false, settingsOff = [], concise }) {
   const lines = [`Troxy ${version || ''}`.trim() + (allPaused ? ' · off on this machine' : ` · routing is ${paused ? 'off' : 'on'}`)];
   if (allPaused) lines.push('Everything is paused: no model, effort or subagent changes, no compaction, nothing kept awake.');
   lines.push(`This session: ${savings || 'nothing moved to a lighter model yet'}`);
@@ -478,6 +521,7 @@ function statusText({ version, paused, allPaused = false, savings, rateLimits = 
   lines.push('The model is picked at the start, after an hour idle or after a compaction, then kept (switching would rewrite the cache). /model always wins.');
   lines.push(compactOff ? 'Idle compaction is off (/troxy compact on).'
     : `Idle compaction is on: sessions over ${COMPACT_MIN_TOKENS / 1000}k tokens are compacted after ${COMPACT_IDLE_MS / 60000} min idle (/troxy compact off).`);
+  if (typeof concise === 'boolean') lines.push(concise ? 'Short answers are on in this session (/troxy concise off, for new sessions).' : 'Short answers are off in this session (/troxy concise on, for new sessions).');
   if (settingsOff.length) lines.push(`Turned off in Settings on dash.troxy.io: ${settingsOff.join(', ')}.`);
   lines.push('All sessions and the on/off switches: dash.troxy.io');
   lines.push(paused || allPaused ? 'Type /troxy on to resume.' : 'Type /troxy off to pause everything.');
@@ -1136,7 +1180,7 @@ export function register(on) {
   on('tool.call', { tool: 'Bash' }, guardBash).catch(failClosed);
   on('session.start', async ($, e, next) => {
     interactive = e.isInteractive !== false; // claude -p and Agent SDK runs: false (leversOff)
-    await $.command.register({ name: 'troxy', description: 'Troxy: status, pause or resume, connect this machine', argumentHint: '[status|on|off|connect|compact on|compact off]' });
+    await $.command.register({ name: 'troxy', description: 'Troxy: status, pause or resume, connect this machine', argumentHint: '[status|on|off|connect|compact on|compact off|concise on|concise off]' });
     // A resumed session would otherwise inherit its last routing note, and its background
     // calls before the next prompt would show as savings on the dashboard.
     const sid = await $.session.id();
@@ -1148,6 +1192,13 @@ export function register(on) {
     return next(e);
   });
   on('command.run', { command: 'troxy' }, async ($, e) => {
+    const k = /^\s*concise\s+(on|off)\s*$/i.exec(String(e.args || ''));
+    if (k) {
+      const off = k[1].toLowerCase() === 'off';
+      await $.store.set('conciseOff', off);
+      return { text: off ? 'Troxy short answers are off, from your next new session. This session keeps its prompt, so its cache is not rewritten.'
+        : 'Troxy short answers are on, from your next new session.' };
+    }
     const c = /^\s*compact\s+(on|off)\s*$/i.exec(String(e.args || ''));
     if (c) {
       await $.store.set('compactOff', c[1].toLowerCase() === 'off');
@@ -1173,12 +1224,14 @@ export function register(on) {
     const { value: connect } = await $.state.get(CONNECT);
     if (connect) return { text: connect };
     return { text: statusText({ version: manifest.version, paused: r.paused || await switchedOff($, 'routing'), allPaused: await allOff($), savings: (await $.state.get(SAVINGS)).value, rateLimits: (await $.session.usage()).rateLimits,
-      compactOff: Boolean(await $.store.get('compactOff')) || await switchedOff($, 'idle_compact'), settingsOff }) };
+      compactOff: Boolean(await $.store.get('compactOff')) || await switchedOff($, 'idle_compact'), settingsOff,
+      concise: await conciseOn($).catch(() => false) }) };
   });
   // Routing fails open: a scorer or hook error must never break the session,
   // it just means the requested model is used as-is.
   on('prompt.submit', scorePrompt).catch(($, e, next) => { decision = null; return next(e); });
   on('command.run', { command: 'model' }, pinModel).catch(async ($, e, next) => next(e));
+  on('prompt.compose', composeConcise).catch(async ($, e, next) => next(e));
   on('command.run', { command: 'rewind' }, async ($, e, next) => { try { await noteRegret($, await $.session.id()); } catch {} return next(e); });
   on('session.compact', async ($, e, next) => {
     let r;
@@ -1239,4 +1292,4 @@ export function register(on) {
 }
 
 // Exported for tests only - not part of the mod's runtime contract.
-export const _internal = { holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
+export const _internal = { composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
