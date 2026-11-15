@@ -213,11 +213,18 @@ function savingsText(s, arm) {
 
 // This session's savings from the server, or null when there is no key, no session id or
 // the call fails (the band then keeps what it showed).
+// The person's home folder. Windows started from PowerShell or cmd has no HOME, only USERPROFILE:
+// without this the add-on found no config there, showed no connect code and did nothing, silently
+// (read from the code 2026-11-15; not yet run on a Windows machine). Forward slashes in the paths
+// built from it are fine on Windows.
+async function homeDir($) {
+  return (await $.env.get('HOME')) || (await $.env.get('USERPROFILE')) || undefined;
+}
 // The Troxy key and setup from ~/.troxy/config.json (TROXY_API_KEY wins for the key).
 async function troxyConfig($) {
   let cfg = {};
   try {
-    const home = await $.env.get('HOME');
+    const home = await homeDir($);
     if (home) cfg = JSON.parse(await $.fs.read(`${home}/.troxy/config.json`)) || {};
   } catch {}
   return { ...cfg, apiKey: (await $.env.get('TROXY_API_KEY')) || cfg.apiKey };
@@ -292,7 +299,7 @@ const CONCISE = { id: 'troxy-guard:concise', scope: 'session',
   text: '## Output style (via Troxy)\n\n- Thorough in reasoning, concise in output.\n- No openers or closing fluff.' };
 const conciseBySession = new Map(); // sid -> boolean, on disk as concise:<sid>
 async function conciseInClaudeMd($) {
-  try { return (await $.fs.read(`${await $.env.get('HOME')}/.claude/CLAUDE.md`)).includes('troxy:concise:start'); } catch { return false; }
+  try { return (await $.fs.read(`${await homeDir($)}/.claude/CLAUDE.md`)).includes('troxy:concise:start'); } catch { return false; }
 }
 async function conciseOn($) {
   const sid = await $.session.id();
@@ -332,7 +339,7 @@ async function connectFailed($, why) {
 async function connectDevice($) {
   if (connecting) return;
   if ((await troxyConfig($)).apiKey) { await $.state.set(CONNECT, null); return; }
-  const home = await $.env.get('HOME');
+  const home = await homeDir($);
   if (!home) return;
   let start;
   try {
@@ -453,7 +460,7 @@ const savedSeen = new Map();
 async function compressedSince($, sid, dir = 'saved') {
   try {
     if (!/^[A-Za-z0-9-]{8,128}$/.test(String(sid))) return 0;
-    const home = await $.env.get('HOME');
+    const home = await homeDir($);
     const text = await $.fs.read(`${home}/.troxy/sandbox/${dir}/${sid}.log`);
     const total = String(text).split('\n').reduce((n, l) => n + (Number(l) || 0), 0);
     const key = `${dir}:${sid}`;
@@ -495,7 +502,7 @@ async function noteStep($, result, meta) {
 // ponytail: read-then-write (fs has no append); a CLI write at the same instant can be lost.
 async function logSent($, path, body) {
   try {
-    const home = await $.env.get('HOME');
+    const home = await homeDir($);
     if (!home) return;
     const f = `${home}/.troxy/sent.log`;
     let old = '';
@@ -1302,4 +1309,4 @@ export function register(on) {
 }
 
 // Exported for tests only - not part of the mod's runtime contract.
-export const _internal = { isScript, composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
+export const _internal = { homeDir, isScript, composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
