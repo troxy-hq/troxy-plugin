@@ -245,9 +245,19 @@ async function allOff($) {
 }
 // Scripts, CI jobs and Agent SDK apps (claude -p; isInteractive false at session.start) get no lever
 // at all: they asked for a model and a behavior on purpose, and nobody is there to see a change.
+// The desktop app, the IDE extensions and the mobile app run Claude Code through the SDK, so
+// isInteractive is false there too, yet a person is at the prompt. 1.42.0 took those sessions for
+// scripts: no lever ran in the desktop app and its rows carried no arm (found 2026-11-15 in the
+// first stretch export). A session that draws somewhere ($.session.surfaces(), attached after
+// start) is a person's session; a script or a bare SDK run draws nowhere.
 let interactive = true;
+async function isScript($) {
+  if (interactive) return false;
+  try { if ((await $.session.surfaces()).length > 0) { interactive = true; return false; } } catch {}
+  return true;
+}
 async function leversOff($) {
-  return !interactive || (await allOff($));
+  return (await isScript($)) || (await allOff($));
 }
 async function routingOff($) {
   return (await leversOff($)) || switchedOff($, 'routing');
@@ -1087,7 +1097,7 @@ async function* routeStep($, e, next) {
   if (!(await connected($))) return yield* next(e);
   // A script, CI job or Agent SDK run: sent as Claude Code made it, no arm drawn, reported with no
   // arm so it never enters the treated vs holdout comparison (launch re-review 2026-11-12).
-  if (!interactive) {
+  if (await isScript($)) {
     const result = yield* next(e);
     try { await noteStep($, result, { requested: e.model, arm: null, cold: false, score: null, effort: e.effort, effortAsked: e.effort, agentId: e.agentId }); } catch {}
     return result;
@@ -1292,4 +1302,4 @@ export function register(on) {
 }
 
 // Exported for tests only - not part of the mod's runtime contract.
-export const _internal = { composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
+export const _internal = { isScript, composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
