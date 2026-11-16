@@ -771,12 +771,9 @@ async function scorePrompt($, e, next) {
     if (typeof stored === 'number' && (idleSince == null || stored > idleSince)) idleSince = stored;
   } catch {}
   if (await engineOn($).catch(() => false)) {
-    // Engine mode: trim on return, once the cache has expired, before this prompt goes out.
-    // TROXY_ENGINE_TRIM_FIRST=1 is for the fork benchmark only: a forked session has a new id, so
-    // Troxy has no record of it and would leave it alone. With the switch, the first prompt of a
-    // session Troxy has not seen is treated as a return after a break.
-    const first = !ls && (await $.env.get('TROXY_ENGINE_TRIM_FIRST')) === '1';
-    if (first || (idleSince != null && now - idleSince >= ENGINE_COLD_MS)) { try { await engineTrim($, { cold: true, first }); } catch {} } // fail open
+    // Engine mode: nothing here. Claude Code refuses $.session.compact() from a prompt.submit hook
+    // ("it would compact under the turn this hook is holding", seen in 1.44.1), so the trim is made
+    // between turns by armEngineReturn, and at session start under the benchmark switch.
   } else if (idleSince != null && now - idleSince >= COMPACT_IDLE_MS) {
     try { await idleCompact($, { late: true }); } catch {} // fail open: send the prompt as-is
   }
@@ -1218,13 +1215,47 @@ async function engineAfterTurn($, e) {
     big = afterTurnDelay({ tokens: ((await $.session.usage()).context || {}).tokens || 0,
       on: afterAnswerAllowed(e) && await bigCompactOn($), off: await $.store.get('compactOff') }) !== COMPACT_IDLE_MS;
   } catch {}
+  const idleAt = await $.clock.now();
   if (big) {
     compactTimer = $.clock.after(BIG_COMPACT_DELAY_MS, () => {
       compactTimer = null;
-      engineTrim($, { cold: false }).catch(() => {});
+      engineTrim($, { cold: false }).catch(() => {}).finally(() => armEngineReturn($, idleAt));
     });
-  }
+  } else armEngineReturn($, idleAt);
   return big;
+}
+// The trim on return. It cannot be made when the prompt arrives (Claude Code refuses a compaction
+// from a prompt.submit hook), so it is made between turns, as soon as the cache has expired: a
+// short timer that reads the wall clock. A sleeping Mac freezes the timer, so it fires within
+// ENGINE_POLL_MS of waking, and nothing is kept awake. A prompt typed first cancels it (scorePrompt).
+// ponytail: a prompt sent within ENGINE_POLL_MS of waking, or after a restart, goes out untrimmed.
+const ENGINE_POLL_MS = 30 * 1000;
+function armEngineReturn($, idleAt) {
+  if (compactTimer) return; // something newer is armed
+  const timer = $.clock.after(ENGINE_POLL_MS, async () => {
+    if (compactTimer !== timer) return;
+    compactTimer = null;
+    try {
+      if ((await $.clock.now()) - idleAt < ENGINE_COLD_MS) return armEngineReturn($, idleAt);
+      await engineTrim($, { cold: true });
+    } catch {}
+  });
+  compactTimer = timer;
+}
+// TROXY_ENGINE_TRIM_FIRST=1, for the fork benchmark only: a forked session has a new id, so Troxy
+// has no record of it and would leave it alone. With the switch, a session Troxy has not seen is
+// trimmed a moment after it starts, before its first prompt, as a return after a break.
+const ENGINE_FIRST_DELAY_MS = 1000;
+async function engineTrimFirst($) {
+  if (!(await engineOn($)) || (await $.env.get('TROXY_ENGINE_TRIM_FIRST')) !== '1') return false;
+  if (await lastSentFor($, await $.session.id())) return false;
+  cancelCompact();
+  const timer = $.clock.after(ENGINE_FIRST_DELAY_MS, () => {
+    if (compactTimer === timer) compactTimer = null;
+    engineTrim($, { cold: true, first: true }).catch(() => {});
+  });
+  compactTimer = timer;
+  return true;
 }
 
 // /model wins (launch re-review 2026-11-12). A typed /model names the model the person wants now,
@@ -1382,6 +1413,7 @@ export function register(on) {
     $.ui.status(undefined); // the bar moved to the band above the prompt
     connectDevice($).catch(() => {}); // first run without a key: show a connect code
     armCompact($, COMPACT_IDLE_MS); // a hot reload cancels the old timer
+    try { await engineTrimFirst($); } catch {}
     return next(e);
   });
   on('command.run', { command: 'troxy' }, async ($, e) => {
@@ -1489,4 +1521,4 @@ export function register(on) {
 }
 
 // Exported for tests only - not part of the mod's runtime contract.
-export const _internal = { noteReread, takeEngine, engineOn, engineTrim, engineAfterTurn, trimmedFiles, sittingSteps, ENGINE_COLD_MS, ENGINE_SUMMARY_ABOVE, takeLastEngine: () => lastEngine, trimDecision, enginePrice, ENGINE_MARGIN, ENGINE_DEFAULT_STEPS, ENGINE_MIN_TRIM_TOKENS, homeDir, isScript, composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
+export const _internal = { armEngineReturn, engineTrimFirst, ENGINE_POLL_MS, noteReread, takeEngine, engineOn, engineTrim, engineAfterTurn, trimmedFiles, sittingSteps, ENGINE_COLD_MS, ENGINE_SUMMARY_ABOVE, takeLastEngine: () => lastEngine, trimDecision, enginePrice, ENGINE_MARGIN, ENGINE_DEFAULT_STEPS, ENGINE_MIN_TRIM_TOKENS, homeDir, isScript, composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
