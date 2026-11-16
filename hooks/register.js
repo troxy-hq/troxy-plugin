@@ -1163,12 +1163,17 @@ async function engineTrim($, { cold, first = false }) {
   const d = trimDecision({ model, cold: Boolean(cold), keptTokens: kept, trimmedTokens: trimmed, stepsLeft: steps });
   lastEngine = { ...d, cold: Boolean(cold), kept, trimmed, steps };
   if (d.action !== 'trim') return d;
-  let r;
+  let r, err;
   engineRun = d;
   compacting = true; // if a summary does run, its call goes out as Troxy's compaction (compactionStep)
   try { r = await $.session.compact({ instructions: COMPACT_INSTRUCTIONS }); }
+  catch (x) { err = x; }
   finally { compacting = false; engineRun = null; }
-  if (!r || r.skip) return d;
+  // What the trim call came to, on the usage row next to the decision (1.44.0 decided to trim in
+  // real sessions and nothing was trimmed, with no trace of why).
+  const short = (v) => String(v).slice(0, 160);
+  lastEngine.out = err ? `error: ${short((err && err.message) || err)}` : !r ? 'empty' : r.skip ? `skip: ${short(r.skip)}` : 'ok';
+  if (err || !r || r.skip) return d;
   const k = n => `${Math.round(n / 1000)}k`;
   const what = lastMask === 'stub' ? 'trimmed old tool output' : 'compacted this session';
   await $.state.set(COMPACTED, { at: await $.clock.now(), text: r.tokensBefore && r.tokensAfter ? `${what} ${k(r.tokensBefore)} → ${k(r.tokensAfter)} tokens` : what });
@@ -1183,7 +1188,7 @@ function takeEngine() {
   lastEngine = null;
   rereads = 0;
   if (!d && !n) return null;
-  return { ...(d ? { a: d.action, why: d.reason, save: d.savingUsd, cost: d.costUsd, cold: d.cold ? 1 : 0, kept: d.kept, trimmed: d.trimmed, steps: d.steps } : {}),
+  return { ...(d ? { a: d.action, why: d.reason, save: d.savingUsd, cost: d.costUsd, cold: d.cold ? 1 : 0, kept: d.kept, trimmed: d.trimmed, steps: d.steps, ...(d.out ? { out: d.out } : {}) } : {}),
     ...(n ? { reread: n } : {}) };
 }
 // The quality signal: Claude reads a file again whose earlier output the engine shortened. Each
