@@ -423,7 +423,7 @@ const REPORT_KEEP_ROWS = 1000; // kept for the next try while Troxy is unreachab
 let pending = [];
 let compacting = false;
 
-function reportRow({ sid, usage, requested, arm, cold, score, compact, compactArm, rateLimits, ts, effort, effortAsked, surfaces, compressed, recalled, subArm, agentId, cut, cutArm, mask, clear, paused, addonVersion, stretch }) {
+function reportRow({ sid, usage, requested, arm, cold, score, compact, compactArm, rateLimits, ts, effort, effortAsked, surfaces, compressed, recalled, subArm, agentId, cut, cutArm, mask, clear, paused, addonVersion, stretch, engine }) {
   const rl = {};
   for (const w of rateLimits || []) {
     if (!WINDOW_LABEL[w.kind]) continue;
@@ -447,7 +447,10 @@ function reportRow({ sid, usage, requested, arm, cold, score, compact, compactAr
     // Every lever follows the session arm since 1.41.0 (sessionArm); the keys stay so old rows still read.
     levers: { mask_arm: arm || null, effort_arm: arm || null, clear_arm: arm || null, ...(clear || {}), ...(mask ? { mask } : {}), ...(cutArm ? { cut_arm: cutArm, cut } : {}),
       // The stretch the row belongs to (sessionArm), so the readout groups rows by stretch.
-      ...(stretch && stretch.id ? { stretch_id: stretch.id, prev_arm: stretch.prev || null, ctx_at_draw: stretch.ctx == null ? null : stretch.ctx, prompt_n: stretch.n || 0 } : {}) },
+      ...(stretch && stretch.id ? { stretch_id: stretch.id, prev_arm: stretch.prev || null, ctx_at_draw: stretch.ctx == null ? null : stretch.ctx, prompt_n: stretch.n || 0 } : {}),
+      // The decision engine's last decision and what it predicted (takeEngine), and re-reads of
+      // files it shortened: predicted against actual, and the quality signal next to the saving.
+      ...(engine ? { engine } : {}) },
     surface: (surfaces || []).includes('desktop') ? 'desktop' : (surfaces || []).includes('terminal') ? 'terminal' : null,
   };
 }
@@ -493,8 +496,8 @@ async function noteStep($, result, meta) {
   const sid = await $.session.id();
   const mask = lastMask; lastMask = null;
   const clear = await clearFlags($, sid, await $.clock.now());
-  const addonVersion = await addonVersionOf($), stretch = await stretchOf($, sid);
-  pending.push(reportRow({ ...meta, mask, clear, addonVersion, stretch, sid, usage, compact: compacting, compactArm: meta.arm, rateLimits, surfaces, compressed: await compressedSince($, sid), recalled: await recalledSince($, sid), ts: await $.clock.now() }));
+  const addonVersion = await addonVersionOf($), stretch = await stretchOf($, sid), engine = takeEngine();
+  pending.push(reportRow({ ...meta, mask, clear, addonVersion, stretch, engine, sid, usage, compact: compacting, compactArm: meta.arm, rateLimits, surfaces, compressed: await compressedSince($, sid), recalled: await recalledSince($, sid), ts: await $.clock.now() }));
   if (pending.length > REPORT_KEEP_ROWS) pending = pending.slice(-REPORT_KEEP_ROWS);
 }
 
@@ -529,14 +532,15 @@ async function flushReport($) {
 }
 
 // /troxy status: everything about this session's Troxy in one place.
-function statusText({ version, paused, allPaused = false, savings, rateLimits = [], compactOff = false, settingsOff = [], concise }) {
+function statusText({ version, paused, allPaused = false, savings, rateLimits = [], compactOff = false, settingsOff = [], concise, engine = false }) {
   const lines = [`Troxy ${version || ''}`.trim() + (allPaused ? ' · off on this machine' : ` · routing is ${paused ? 'off' : 'on'}`)];
   if (allPaused) lines.push('Everything is paused: no model, effort or subagent changes, no compaction, nothing kept awake.');
   lines.push(`This session: ${savings || 'nothing moved to a lighter model yet'}`);
   const meter = rateLimits.filter(w => WINDOW_LABEL[w.kind]).map(w => `${WINDOW_LABEL[w.kind]} ${Math.round(w.percentUsed)}%`);
   if (meter.length) lines.push(`Plan usage now: ${meter.join(' · ')}`);
   lines.push('The model is picked at the start, after an hour idle or after a compaction, then kept (switching would rewrite the cache). /model always wins.');
-  lines.push(compactOff ? 'Idle compaction is off (/troxy compact on).'
+  if (engine && !compactOff) lines.push('Engine mode is on (TROXY_ENGINE=1): old tool output is shortened when you come back after an hour away. Your messages and the answers are kept, no summary runs unless the session is still very large, and nothing is kept awake (/troxy compact off).');
+  else lines.push(compactOff ? 'Idle compaction is off (/troxy compact on).'
     : `Idle compaction is on: sessions over ${COMPACT_MIN_TOKENS / 1000}k tokens are compacted after ${COMPACT_IDLE_MS / 60000} min idle (/troxy compact off).`);
   if (typeof concise === 'boolean') lines.push(concise ? 'Short answers are on in this session (/troxy concise off, for new sessions).' : 'Short answers are off in this session (/troxy concise on, for new sessions).');
   if (settingsOff.length) lines.push(`Turned off in Settings on dash.troxy.io: ${settingsOff.join(', ')}.`);
@@ -675,6 +679,7 @@ async function bigSession($) {
 // so compact now or not at all: never hold their prompt waiting for a meter reset.
 async function idleCompact($, { late = false, afterAnswer = false } = {}) {
   if (!(await connected($))) return; // not connected yet: Troxy never compacts
+  if (await engineOn($).catch(() => false)) return; // engine mode trims on return instead (engineTrim)
   const u = await $.session.usage();
   const off = (await compactBlocked($)) || await switchedOff($, afterAnswer ? 'compact_after_answer' : 'idle_compact')
     || (!(await $.env.get('TROXY_BIG_COMPACT')) && await compactHoldout($));
@@ -765,7 +770,14 @@ async function scorePrompt($, e, next) {
     const stored = await $.store.get(`idle_started_${sid}`);
     if (typeof stored === 'number' && (idleSince == null || stored > idleSince)) idleSince = stored;
   } catch {}
-  if (idleSince != null && now - idleSince >= COMPACT_IDLE_MS) {
+  if (await engineOn($).catch(() => false)) {
+    // Engine mode: trim on return, once the cache has expired, before this prompt goes out.
+    // TROXY_ENGINE_TRIM_FIRST=1 is for the fork benchmark only: a forked session has a new id, so
+    // Troxy has no record of it and would leave it alone. With the switch, the first prompt of a
+    // session Troxy has not seen is treated as a return after a break.
+    const first = !ls && (await $.env.get('TROXY_ENGINE_TRIM_FIRST')) === '1';
+    if (first || (idleSince != null && now - idleSince >= ENGINE_COLD_MS)) { try { await engineTrim($, { cold: true, first }); } catch {} } // fail open
+  } else if (idleSince != null && now - idleSince >= COMPACT_IDLE_MS) {
     try { await idleCompact($, { late: true }); } catch {} // fail open: send the prompt as-is
   }
   // Not connected yet: no /clear hint (nor its arm draw) and no scorer call; idleCompact checks too.
@@ -1002,6 +1014,9 @@ function maskMessages(messages) {
   const cut = Math.max(0, messages.length - MASK_KEEP_RECENT);
   const toolOf = new Map();
   for (const m of messages) for (const u of m.toolUses || []) toolOf.set(u.tool_use_id, u.tool);
+  // The files whose Read output is shortened, so a later re-read of one can be counted (noteReread).
+  const pathOf = new Map(), files = new Set();
+  for (const m of messages) for (const u of m.toolUses || []) if (u.tool === 'Read' && u.input && typeof u.input.file_path === 'string') pathOf.set(u.tool_use_id, u.input.file_path);
   let removed = 0;
   const out = messages.map((m, i) => {
     if (i >= cut) return m;
@@ -1013,19 +1028,19 @@ function maskMessages(messages) {
       ...rest,
       toolUses: (m.toolUses || []).map(u => {
         const long = stubbable(u.tool, u.text);
-        if (long) removed += String(u.text).length - MASK_HEAD_CHARS;
+        if (long) { removed += String(u.text).length - MASK_HEAD_CHARS; if (pathOf.has(u.tool_use_id)) files.add(pathOf.get(u.tool_use_id)); }
         const { result, ...k } = u;
         return { ...k, input: stubInput(u.input), ...(u.text === undefined ? {} : { text: long ? stub(u.tool, u.text) : u.text }) };
       }),
       ...(m.toolResults ? { toolResults: m.toolResults.map(r => {
         const long = stubbable(toolOf.get(r.tool_use_id), r.text);
-        if (long) removed += String(r.text).length - MASK_HEAD_CHARS;
+        if (long) { removed += String(r.text).length - MASK_HEAD_CHARS; if (pathOf.has(r.tool_use_id)) files.add(pathOf.get(r.tool_use_id)); }
         const { result, meta, ...k } = r;
         return long ? { ...k, text: stub(toolOf.get(r.tool_use_id), r.text) } : k;
       }) } : {}),
     };
   });
-  return { messages: out, removedChars: removed };
+  return { messages: out, removedChars: removed, files: [...files] };
 }
 function messagesTokens(messages) {
   let n = 0;
@@ -1036,21 +1051,175 @@ function messagesTokens(messages) {
   }
   return Math.ceil(n / 4);
 }
+// --- The decision engine (launch review 2026-11-16, Product priorities). Before a trim it asks one
+// question: what does this save, what does it cost, and does it pay? Pure: state in, decision out,
+// so it is tested as a table of cases with no session (see the trimDecision tests).
+//
+// Prices are list USD per million tokens for reading the prompt cache and for writing it with the
+// 1-hour TTL (Anthropic's pricing page, checked 2026-11-14). Longest name first, so opus-5-5 wins
+// over opus-5. A model that is not listed is never trimmed: a price is never guessed.
+const ENGINE_PRICES = [
+  ['fable-5-2', 0.20, 16], ['fable-5-1', 0.25, 20],
+  ['opus-5-5', 0.20, 8], ['sonnet-5-5', 0.10, 4], ['haiku-5-5', 0.01, 0.20],
+  ['opus-5', 0.50, 10], ['sonnet-5', 0.20, 4], ['haiku-4-5', 0.10, 2],
+];
+function enginePrice(model) {
+  const m = String(model || '').toLowerCase();
+  const row = ENGINE_PRICES.find(([name]) => m.includes(name));
+  return row ? { read: row[1], write: row[2] } : null;
+}
+// Starting guesses, to tune from the fork test and the usage rows (levers.engine):
+const ENGINE_MARGIN = 1.5; // on a warm cache the saving must beat the cost by this much
+const ENGINE_DEFAULT_STEPS = 20; // steps still expected when nothing better is known
+const ENGINE_MIN_TRIM_TOKENS = 10000; // less than this is not worth touching the conversation for
+// The decision for one possible trim.
+//   model          the model the session runs on (its cache prices)
+//   cold           true when the prompt cache has expired, so the next step rewrites everything anyway
+//   keptTokens     tokens that stay in the conversation after the trim
+//   trimmedTokens  tokens the trim removes
+//   stepsLeft      steps still expected in this sitting
+// Returns { action: 'trim' | 'none', reason, savingUsd, costUsd, breakEvenSteps }.
+//   saving = trimmed x read price x stepsLeft, plus trimmed x write price once when cold
+//   cost   = kept x write price once when warm (the rewrite the trim forces); nothing when cold
+//   cold: always trim (it costs nothing). warm: trim only when saving > cost x margin.
+function trimDecision({ model, cold, keptTokens, trimmedTokens, stepsLeft = ENGINE_DEFAULT_STEPS, margin = ENGINE_MARGIN }) {
+  const none = (reason) => ({ action: 'none', reason, savingUsd: 0, costUsd: 0, breakEvenSteps: null });
+  const p = enginePrice(model);
+  if (!p) return none('unknown_model');
+  const trimmed = Math.max(0, Number(trimmedTokens) || 0), kept = Math.max(0, Number(keptTokens) || 0);
+  if (trimmed < ENGINE_MIN_TRIM_TOKENS) return none('too_little');
+  const steps = Math.max(0, Number(stepsLeft) || 0);
+  const perStep = trimmed * p.read / 1e6; // every later step reads this much less from the cache
+  const cost = cold ? 0 : kept * p.write / 1e6;
+  const saving = perStep * steps + (cold ? trimmed * p.write / 1e6 : 0);
+  const usd = (n) => Math.round(n * 1e4) / 1e4;
+  const out = { savingUsd: usd(saving), costUsd: usd(cost), breakEvenSteps: cold ? 0 : Math.ceil(cost / perStep) };
+  if (cold) return { action: 'trim', reason: 'cold', ...out };
+  return saving > cost * margin ? { action: 'trim', reason: 'warm_pays', ...out } : { action: 'none', reason: 'warm_too_few_steps', ...out };
+}
+
 let lastMask = null; // what the last compaction did, for the report row: 'stub' | 'stub+summary' | null
 async function maskCompact($, e, next) {
   if (e.trigger !== 'plugin' || e.agentId || !Array.isArray(e.messages) || !(await connected($)) || (await leversOff($))) return next(e);
   const sid = await $.session.id();
   if ((await sessionArm($, sid)) !== 'treated' || (await $.env.get('TROXY_MASK')) === '0') return next(e);
   const before = messagesTokens(e.messages);
-  const { messages, removedChars } = maskMessages(e.messages);
-  if (!removedChars) return next(e);
+  const { messages, removedChars, files } = maskMessages(e.messages);
+  // An engine trim (engineTrim) that finds nothing to shorten after all leaves the conversation as
+  // it is; it never falls through to a summary.
+  if (!removedChars) return engineRun ? { skip: 'Troxy found nothing to shorten.' } : next(e);
   const after = messagesTokens(messages);
-  if (after <= MASK_ENOUGH_TOKENS) {
+  if (engineRun) trimmedFiles.set(sid, new Set(files));
+  // Shorten-only is the normal outcome of an engine trim: a summary runs only when the session is
+  // still above ENGINE_SUMMARY_ABOVE after shortening. Without the engine the limit stays 60k.
+  if (after <= (engineRun ? ENGINE_SUMMARY_ABOVE : MASK_ENOUGH_TOKENS)) {
     lastMask = 'stub';
     return { messages, tokensBefore: before, tokensAfter: after };
   }
   lastMask = 'stub+summary';
   return next({ ...e, messages });
+}
+
+// --- Engine mode (TROXY_ENGINE=1): trim on return, through the decision engine. Off by default, so
+// nothing changes for anyone until the fork test has a number; then make it the default.
+//   - When the person comes back after the cache expired (ENGINE_COLD_MS), old tool output is
+//     shortened before the prompt goes out. Every user message and every answer is kept. No model
+//     call, so nothing has to run before the cache expires: no idle timer and nothing kept awake.
+//   - A summary runs only when the session is still above ENGINE_SUMMARY_ABOVE after shortening.
+//   - Right after an answer past 200k the engine is asked whether a warm trim pays (trimDecision);
+//     it usually does not, so a warm session is left alone.
+//   - TROXY_ENGINE_TRIM_FIRST=1, for the fork benchmark only, also trims at the first prompt of a
+//     session Troxy has not seen (a fork has a new id). Never set it for normal use.
+// Same gates as every lever: connected, /troxy off, TROXY_OFF, scripts, DISABLE_AUTO_COMPACT,
+// /troxy compact off, the Settings switches, and treated stretches only.
+const ENGINE_COLD_MS = 60 * 60 * 1000; // the 1-hour prompt cache has expired
+const ENGINE_SUMMARY_ABOVE = 150000; // after shortening, a session still above this gets a summary (a starting guess)
+async function engineOn($) {
+  return (await $.env.get('TROXY_ENGINE')) === '1';
+}
+let engineRun = null; // the decision an engine trim under way acts on (maskCompact reads it)
+let lastEngine = null; // the last decision made, for the next usage row
+const trimmedFiles = new Map(); // sid -> Set of files whose Read output the engine shortened
+// Main-loop steps since the last cold moment, per session: a sitting that has run N steps is
+// expected to run about N more. ponytail: in memory, a restart falls back to ENGINE_DEFAULT_STEPS.
+const sittingSteps = new Map();
+async function engineTrim($, { cold, first = false }) {
+  if (!(await connected($)) || (await compactBlocked($)) || (await $.env.get('TROXY_MASK')) === '0') return null;
+  if (await switchedOff($, cold ? 'idle_compact' : 'compact_after_answer')) return null;
+  const sid = await $.session.id();
+  const ls = await lastSentFor($, sid);
+  // A session Troxy has not sent a step for is left alone, except under the benchmark switch
+  // (first), where the model is the one the session asks for.
+  let model = ls && ls.model;
+  if (!model && first) try { model = await $.session.model(); } catch {}
+  if (!model) return null;
+  if ((await sessionArm($, sid)) !== 'treated') return null; // a comparison stretch gets nothing
+  const msgs = await $.session.messages();
+  if (!Array.isArray(msgs)) return null;
+  const trimmed = Math.ceil(maskMessages(msgs).removedChars / 4);
+  const total = (((await $.session.usage()).context) || {}).tokens || messagesTokens(msgs);
+  const kept = Math.max(0, total - trimmed);
+  const steps = Math.max(ENGINE_DEFAULT_STEPS, sittingSteps.get(sid) || 0);
+  const d = trimDecision({ model, cold: Boolean(cold), keptTokens: kept, trimmedTokens: trimmed, stepsLeft: steps });
+  lastEngine = { ...d, cold: Boolean(cold), kept, trimmed, steps };
+  if (d.action !== 'trim') return d;
+  let r;
+  engineRun = d;
+  compacting = true; // if a summary does run, its call goes out as Troxy's compaction (compactionStep)
+  try { r = await $.session.compact({ instructions: COMPACT_INSTRUCTIONS }); }
+  finally { compacting = false; engineRun = null; }
+  if (!r || r.skip) return d;
+  const k = n => `${Math.round(n / 1000)}k`;
+  const what = lastMask === 'stub' ? 'trimmed old tool output' : 'compacted this session';
+  await $.state.set(COMPACTED, { at: await $.clock.now(), text: r.tokensBefore && r.tokensAfter ? `${what} ${k(r.tokensBefore)} → ${k(r.tokensAfter)} tokens` : what });
+  return d;
+}
+// What the next usage row says about the engine (levers.engine), then cleared so it is said once:
+// the decision (a: trim or none, why, the predicted save and cost in USD, cold 1 or 0, kept and
+// trimmed tokens, steps expected) and reread, the number of shortened files Claude read again.
+let rereads = 0;
+function takeEngine() {
+  const d = lastEngine, n = rereads;
+  lastEngine = null;
+  rereads = 0;
+  if (!d && !n) return null;
+  return { ...(d ? { a: d.action, why: d.reason, save: d.savingUsd, cost: d.costUsd, cold: d.cold ? 1 : 0, kept: d.kept, trimmed: d.trimmed, steps: d.steps } : {}),
+    ...(n ? { reread: n } : {}) };
+}
+// The quality signal: Claude reads a file again whose earlier output the engine shortened. Each
+// file counts once. Many of these means the trim cut something still needed: keep more recent
+// messages (MASK_KEEP_RECENT). Main conversation only; the Read itself is never changed or delayed.
+async function noteReread($, e, next) {
+  try {
+    if (!e.agentId && typeof e.file_path === 'string') {
+      const files = trimmedFiles.get(await $.session.id());
+      if (files && files.delete(e.file_path)) rereads += 1;
+    }
+  } catch {}
+  return next(e);
+}
+
+// Engine mode after an answer: no idle timer and nothing kept awake. The idle start is kept on disk
+// for the trim on return (a restart loses lastSent), and past 200k the engine is asked, after the
+// same short delay as before, whether a warm trim pays. A prompt typed first cancels it (scorePrompt).
+async function engineAfterTurn($, e) {
+  cancelCompact();
+  try {
+    Promise.all([$.session.id(), $.clock.now()])
+      .then(([sid, at]) => $.store.set(`idle_started_${sid}`, at)).catch(() => {});
+  } catch {}
+  let big = false;
+  try {
+    big = afterTurnDelay({ tokens: ((await $.session.usage()).context || {}).tokens || 0,
+      on: afterAnswerAllowed(e) && await bigCompactOn($), off: await $.store.get('compactOff') }) !== COMPACT_IDLE_MS;
+  } catch {}
+  if (big) {
+    compactTimer = $.clock.after(BIG_COMPACT_DELAY_MS, () => {
+      compactTimer = null;
+      engineTrim($, { cold: false }).catch(() => {});
+    });
+  }
+  return big;
 }
 
 // /model wins (launch re-review 2026-11-12). A typed /model names the model the person wants now,
@@ -1140,6 +1309,7 @@ async function* routeStep($, e, next) {
   const hold = firstSight || pinned || (!isCold && Boolean(ls && ls.firstSight));
   const arm = await sessionArm($, sid);
   const paused = await allOff($);
+  sittingSteps.set(sid, isCold ? 1 : (sittingSteps.get(sid) || 0) + 1); // for the engine's steps-left estimate
   if (promptPending) {
     promptPending = false;
     try { const s = await $.store.get(`stretch:${sid}`); if (s) await $.store.set(`stretch:${sid}`, { ...s, n: (s.n || 0) + 1 }); } catch {}
@@ -1195,6 +1365,7 @@ async function* routeStep($, e, next) {
 
 export function register(on) {
   on('tool.call', { tool: 'Bash' }, guardBash).catch(failClosed);
+  on('tool.call', { tool: 'Read' }, noteReread).catch(async ($, e, next) => next(e)); // fails open
   on('session.start', async ($, e, next) => {
     interactive = e.isInteractive !== false; // claude -p and Agent SDK runs: false (leversOff)
     await $.command.register({ name: 'troxy', description: 'Troxy: status, pause or resume, connect this machine', argumentHint: '[status|on|off|connect|compact on|compact off|concise on|concise off]' });
@@ -1242,7 +1413,7 @@ export function register(on) {
     if (connect) return { text: connect };
     return { text: statusText({ version: manifest.version, paused: r.paused || await switchedOff($, 'routing'), allPaused: await allOff($), savings: (await $.state.get(SAVINGS)).value, rateLimits: (await $.session.usage()).rateLimits,
       compactOff: Boolean(await $.store.get('compactOff')) || await switchedOff($, 'idle_compact'), settingsOff,
-      concise: await conciseOn($).catch(() => false) }) };
+      concise: await conciseOn($).catch(() => false), engine: await engineOn($).catch(() => false) }) };
   });
   // Routing fails open: a scorer or hook error must never break the session,
   // it just means the requested model is used as-is.
@@ -1297,6 +1468,10 @@ export function register(on) {
         if (line) await $.state.set(LINE, line);
       } catch {} // a missed turn only leaves the band as it was
     }
+    if (await engineOn($).catch(() => false)) {
+      try { await engineAfterTurn($, e); } catch {}
+      return r;
+    }
     let stayAwake = false, delay = COMPACT_IDLE_MS;
     try { stayAwake = await bigSession($); } catch {}
     try {
@@ -1309,4 +1484,4 @@ export function register(on) {
 }
 
 // Exported for tests only - not part of the mod's runtime contract.
-export const _internal = { homeDir, isScript, composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
+export const _internal = { noteReread, takeEngine, engineOn, engineTrim, engineAfterTurn, trimmedFiles, sittingSteps, ENGINE_COLD_MS, ENGINE_SUMMARY_ABOVE, takeLastEngine: () => lastEngine, trimDecision, enginePrice, ENGINE_MARGIN, ENGINE_DEFAULT_STEPS, ENGINE_MIN_TRIM_TOKENS, homeDir, isScript, composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
