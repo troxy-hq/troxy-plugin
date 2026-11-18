@@ -532,14 +532,22 @@ async function flushReport($) {
 }
 
 // /troxy status: everything about this session's Troxy in one place.
-function statusText({ version, paused, allPaused = false, savings, rateLimits = [], compactOff = false, settingsOff = [], concise, engine = false }) {
+function statusText({ version, paused, allPaused = false, savings, rateLimits = [], compactOff = false, settingsOff = [], concise, engine = false, idleMin = ENGINE_NATIVE_TOKENS, engineSeen = null }) {
   const lines = [`Troxy ${version || ''}`.trim() + (allPaused ? ' · off on this machine' : ` · routing is ${paused ? 'off' : 'on'}`)];
   if (allPaused) lines.push('Everything is paused: no model, effort or subagent changes, no compaction, nothing kept awake.');
   lines.push(`This session: ${savings || 'nothing moved to a lighter model yet'}`);
   const meter = rateLimits.filter(w => WINDOW_LABEL[w.kind]).map(w => `${WINDOW_LABEL[w.kind]} ${Math.round(w.percentUsed)}%`);
   if (meter.length) lines.push(`Plan usage now: ${meter.join(' · ')}`);
   lines.push('The model is picked at the start, after an hour idle or after a compaction, then kept (switching would rewrite the cache). /model always wins.');
-  if (engine && !compactOff) lines.push('Engine mode is on (TROXY_ENGINE=1): old tool output is shortened when you come back after an hour away. Your messages and the answers are kept, no summary runs unless the session is still very large, and nothing is kept awake (/troxy compact off).');
+  if (engine && !compactOff) {
+    lines.push('Engine mode is on (TROXY_ENGINE=1): when Claude Code compacts this session after about an hour idle, Troxy shortens old tool output instead of a summary replacing the conversation. Your messages and the answers are kept. Troxy starts no compaction itself and keeps nothing awake (/troxy compact off).');
+    lines.push(idleMin < ENGINE_NATIVE_TOKENS
+      ? `It acts on idle sessions from ${Math.round(idleMin / 1000)}k to ${ENGINE_NATIVE_TOKENS / 1000}k tokens. Past that, Claude Code's own summary runs, as without Troxy.`
+      : `Nothing for it to act on yet: Claude Code only compacts idle sessions past ${Math.round(idleMin / 1000)}k tokens, and there its own summary runs. Start Claude Code with CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=100000.`);
+    if (engineSeen && engineSeen.did) {
+      lines.push(`Last compaction seen in this session: ${engineSeen.trigger}${typeof engineSeen.idleMin === 'number' ? `, ${engineSeen.idleMin} min after the last step` : ''}, ${Math.round((engineSeen.tokens || 0) / 1000)}k tokens: ${engineSeen.did}.`);
+    }
+  }
   else lines.push(compactOff ? 'Idle compaction is off (/troxy compact on).'
     : `Idle compaction is on: sessions over ${COMPACT_MIN_TOKENS / 1000}k tokens are compacted after ${COMPACT_IDLE_MS / 60000} min idle (/troxy compact off).`);
   if (typeof concise === 'boolean') lines.push(concise ? 'Short answers are on in this session (/troxy concise off, for new sessions).' : 'Short answers are off in this session (/troxy concise on, for new sessions).');
@@ -679,7 +687,7 @@ async function bigSession($) {
 // so compact now or not at all: never hold their prompt waiting for a meter reset.
 async function idleCompact($, { late = false, afterAnswer = false } = {}) {
   if (!(await connected($))) return; // not connected yet: Troxy never compacts
-  if (await engineOn($).catch(() => false)) return; // engine mode trims on return instead (engineTrim)
+  if (await engineOn($).catch(() => false)) return; // engine mode starts no compaction (engineCompact)
   const u = await $.session.usage();
   const off = (await compactBlocked($)) || await switchedOff($, afterAnswer ? 'compact_after_answer' : 'idle_compact')
     || (!(await $.env.get('TROXY_BIG_COMPACT')) && await compactHoldout($));
@@ -771,9 +779,8 @@ async function scorePrompt($, e, next) {
     if (typeof stored === 'number' && (idleSince == null || stored > idleSince)) idleSince = stored;
   } catch {}
   if (await engineOn($).catch(() => false)) {
-    // Engine mode: nothing here. Claude Code refuses $.session.compact() from a prompt.submit hook
-    // ("it would compact under the turn this hook is holding", seen in 1.44.1), so the trim is made
-    // between turns by armEngineReturn, and at session start under the benchmark switch.
+    // Engine mode: nothing here. Troxy starts no compaction in engine mode; it answers the one
+    // Claude Code makes while the session sits idle (engineCompact).
   } else if (idleSince != null && now - idleSince >= COMPACT_IDLE_MS) {
     try { await idleCompact($, { late: true }); } catch {} // fail open: send the prompt as-is
   }
@@ -841,15 +848,17 @@ const holdoutDraw = { fraction: 0.5 }; // 50/50 so one user's own sessions give 
 // idle-cold moment (first step, 55+ min idle), once per gap: the idle timer, the returning
 // prompt or the step, whichever asks first, draws and the rest keep it, so an idle compaction
 // belongs to the stretch it serves. Not after a compaction: that would hand the compacted
-// context to a holdout stretch. ponytail: a stretch still inherits the context the one before
+// context to a holdout stretch. gap: asked by engineCompact when Claude Code compacts an idle
+// session, which can be a few minutes before the 55: the gap has begun, so the arm of the coming
+// stretch is drawn there and the returning prompt keeps it. ponytail: a stretch still inherits the context the one before
 // left, which pulls the gap toward 0; per-session arms need more users than we have.
-async function sessionArm($, sid) {
+async function sessionArm($, sid, { gap = false } = {}) {
   const now = await $.clock.now();
   const ls = await lastSentFor($, sid);
   let arm = null, at = null;
   try { arm = await $.store.get(`arm:${sid}`); at = await $.store.get(`arm_at:${sid}`); } catch {}
   const drawnThisGap = typeof at === 'number' && (!ls || at > ls.at);
-  if ((arm === 'holdout' || arm === 'treated') && (drawnThisGap || (ls && now - ls.at < WARM_MS))) return arm;
+  if ((arm === 'holdout' || arm === 'treated') && (drawnThisGap || (!gap && ls && now - ls.at < WARM_MS))) return arm;
   const prevArm = arm === 'holdout' || arm === 'treated' ? arm : null;
   arm = Math.random() < holdoutDraw.fraction ? 'holdout' : 'treated';
   try { await $.store.set(`arm:${sid}`, arm); await $.store.set(`arm_at:${sid}`, now); } catch {}
@@ -983,7 +992,7 @@ async function cutFor($, arm) {
 // Stub old tool output before compacting (launch review lever 4). Most of a big session is
 // old tool output the next task never reads again, so it is cut to its head and a one-line note
 // with no model call; only if the session is still big after that does the summarizer run, over the
-// smaller text. Troxy's own compactions only (trigger plugin), main loop, treated stretches.
+// smaller text. Main loop, treated stretches. See maskCompact for which compactions it reaches.
 const MASK_KEEP_RECENT = 12; // messages at the end kept whole, with their engine handles
 const MASK_MIN_CHARS = 400; // a result shorter than this is kept
 const MASK_ENOUGH_TOKENS = 60000; // after stubbing, at or under this: no summary needed
@@ -1096,20 +1105,21 @@ function trimDecision({ model, cold, keptTokens, trimmedTokens, stepsLeft = ENGI
 }
 
 let lastMask = null; // what the last compaction did, for the report row: 'stub' | 'stub+summary' | null
+// Without engine mode. Claude Code never runs this hook for a compaction Troxy starts itself:
+// $.session.compact() "runs through every hook but the calling one" (in the debug log of a real
+// session, 2026-11-17: "session.compact skipped: re-entry (the plugin's own code raised it)"). So
+// Troxy's own idle and after-answer compactions are plain summaries, and this path only ever sees
+// a compaction another plugin starts. Engine mode answers Claude Code's own instead (engineCompact).
 async function maskCompact($, e, next) {
+  if (await engineOn($).catch(() => false)) return engineCompact($, e, next);
   if (e.trigger !== 'plugin' || e.agentId || !Array.isArray(e.messages) || !(await connected($)) || (await leversOff($))) return next(e);
   const sid = await $.session.id();
   if ((await sessionArm($, sid)) !== 'treated' || (await $.env.get('TROXY_MASK')) === '0') return next(e);
   const before = messagesTokens(e.messages);
-  const { messages, removedChars, files } = maskMessages(e.messages);
-  // An engine trim (engineTrim) that finds nothing to shorten after all leaves the conversation as
-  // it is; it never falls through to a summary.
-  if (!removedChars) return engineRun ? { skip: 'Troxy found nothing to shorten.' } : next(e);
+  const { messages, removedChars } = maskMessages(e.messages);
+  if (!removedChars) return next(e);
   const after = messagesTokens(messages);
-  if (engineRun) trimmedFiles.set(sid, new Set(files));
-  // Shorten-only is the normal outcome of an engine trim: a summary runs only when the session is
-  // still above ENGINE_SUMMARY_ABOVE after shortening. Without the engine the limit stays 60k.
-  if (after <= (engineRun ? ENGINE_SUMMARY_ABOVE : MASK_ENOUGH_TOKENS)) {
+  if (after <= MASK_ENOUGH_TOKENS) {
     lastMask = 'stub';
     return { messages, tokensBefore: before, tokensAfter: after };
   }
@@ -1117,75 +1127,148 @@ async function maskCompact($, e, next) {
   return next({ ...e, messages });
 }
 
-// --- Engine mode (TROXY_ENGINE=1): trim on return, through the decision engine. Off by default, so
-// nothing changes for anyone until the fork test has a number; then make it the default.
-//   - When the person comes back after the cache expired (ENGINE_COLD_MS), old tool output is
-//     shortened before the prompt goes out. Every user message and every answer is kept. No model
-//     call, so nothing has to run before the cache expires: no idle timer and nothing kept awake.
-//   - A summary runs only when the session is still above ENGINE_SUMMARY_ABOVE after shortening.
-//   - Right after an answer past 200k the engine is asked whether a warm trim pays (trimDecision);
-//     it usually does not, so a warm session is left alone.
-//   - TROXY_ENGINE_TRIM_FIRST=1, for the fork benchmark only, also trims at the first prompt of a
-//     session Troxy has not seen (a fork has a new id). Never set it for normal use.
-// Same gates as every lever: connected, /troxy off, TROXY_OFF, scripts, DISABLE_AUTO_COMPACT,
-// /troxy compact off, the Settings switches, and treated stretches only.
-const ENGINE_COLD_MS = 60 * 60 * 1000; // the 1-hour prompt cache has expired
-const ENGINE_SUMMARY_ABOVE = 150000; // after shortening, a session still above this gets a summary (a starting guess)
+// --- Engine mode (TROXY_ENGINE=1). Off by default, so nothing changes for anyone until it is
+// turned on. In engine mode Troxy starts no compaction at all: no timer, no call, nothing kept
+// awake. It answers the compaction Claude Code makes itself when a session sits idle for about an
+// hour (idle compaction, on by default), and shortens old tool output there instead of letting a
+// summary replace the conversation.
+//
+// Why not a call of Troxy's own: Claude Code skips a plugin's hooks on a compaction that plugin
+// starts, so a $.session.compact() from here always ends in a full summary (1.44.0 to 1.44.2).
+// A compaction Claude Code starts does run this hook, and the hook may answer with the messages.
+//
+// An idle compaction is a compaction Claude Code starts (trigger auto or precompute) at least
+// ENGINE_IDLE_MS after the last step, in a session that is not close to its context limit:
+//   - At or past 200k tokens: untouched, in both arms. That is the size Claude Code compacts on
+//     its own, and its summary costs less than a trim (it leaves far fewer tokens).
+//   - Under 200k: reached only when CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS is lowered (100000 is the
+//     lowest Claude Code accepts). Here Troxy owns the outcome. A treated stretch gets old tool
+//     output shortened: every message and every answer is kept, and no model is called. Anything
+//     else (a comparison stretch, /troxy off, compaction switched off, too little to shorten)
+//     leaves the conversation exactly as it is, which is what Claude Code does at that size
+//     without Troxy. Never a summary.
+// Everything else goes through untouched: a compaction because the context is full, a /compact the
+// person types, another plugin's compaction, a subagent's transcript, a session Troxy has not seen.
+// TROXY_ENGINE_MANUAL=1, for the manual check and the fork benchmark only: a typed /compact is
+// answered the same way, at any size, so the trim can be seen without waiting an hour.
+const ENGINE_IDLE_MS = 45 * 60 * 1000; // Claude Code's idle compaction runs after "about an hour"
+const ENGINE_NATIVE_TOKENS = 200000; // Claude Code's default idle compaction threshold
+const ENGINE_NATIVE_MIN_TOKENS = 100000; // the lowest threshold it accepts
+const ENGINE_NEAR_LIMIT = 0.8; // from this share of the context window a compaction may be needed to go on: never answered here
 async function engineOn($) {
   return (await $.env.get('TROXY_ENGINE')) === '1';
 }
-let engineRun = null; // the decision an engine trim under way acts on (maskCompact reads it)
+// The idle compaction threshold Claude Code runs with, from CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS as
+// its docs read it: a positive whole number, raised to 100000 when lower; 200000 when unset.
+function nativeIdleMin(raw) {
+  const v = String(raw == null ? '' : raw).trim();
+  if (!/^\d+$/.test(v) || Number(v) <= 0) return ENGINE_NATIVE_TOKENS;
+  return Math.max(ENGINE_NATIVE_MIN_TOKENS, Number(v));
+}
+// How long the session has sat since its last step or finished answer, by the wall clock; null for
+// a session Troxy has no record of.
+async function idleFor($, sid, now) {
+  const ls = await lastSentFor($, sid);
+  let since = ls ? ls.at : null;
+  try {
+    const stored = await $.store.get(`idle_started_${sid}`);
+    if (typeof stored === 'number' && (since == null || stored > since)) since = stored;
+  } catch {}
+  return since == null ? null : now - since;
+}
 let lastEngine = null; // the last decision made, for the next usage row
 const trimmedFiles = new Map(); // sid -> Set of files whose Read output the engine shortened
 // Main-loop steps since the last cold moment, per session: a sitting that has run N steps is
 // expected to run about N more. ponytail: in memory, a restart falls back to ENGINE_DEFAULT_STEPS.
 const sittingSteps = new Map();
-async function engineTrim($, { cold, first = false }) {
-  if (!(await connected($)) || (await compactBlocked($)) || (await $.env.get('TROXY_MASK')) === '0') return null;
-  if (await switchedOff($, cold ? 'idle_compact' : 'compact_after_answer')) return null;
+async function engineCompact($, e, next) {
+  if (e.agentId || !Array.isArray(e.messages)) return next(e); // a subagent's own transcript
   const sid = await $.session.id();
+  const now = await $.clock.now();
   const ls = await lastSentFor($, sid);
-  // A session Troxy has not sent a step for is left alone, except under the benchmark switch
-  // (first), where the model is the one the session asks for.
+  const idleMs = await idleFor($, sid, now);
+  const idleMin = idleMs == null ? null : Math.round(idleMs / 60000);
+  const byHand = e.trigger === 'manual' && (await $.env.get('TROXY_ENGINE_MANUAL')) === '1';
+  const idle = (e.trigger === 'auto' || e.trigger === 'precompute') && Boolean(ls) && idleMs != null && idleMs >= ENGINE_IDLE_MS;
+  let ctx = {};
+  try { ctx = (await $.session.usage()).context || {}; } catch {}
+  const before = messagesTokens(e.messages);
+  const tokens = ctx.tokens || before;
+  // What Troxy saw and did: every compaction of the main conversation, for /troxy status ...
+  const seen = async (did) => {
+    try { await $.store.set(`engine_seen:${sid}`, { at: now, trigger: String(e.trigger), idleMin, tokens, did }); } catch {}
+  };
+  // ... and each idle compaction (or typed one, under the switch) for the next usage row.
+  const decided = (reason, d = {}) => {
+    lastEngine = { action: 'none', reason, savingUsd: 0, costUsd: 0, kept: tokens, trimmed: 0, steps: 0, ...d, cold: true, trig: String(e.trigger), idle: idleMin };
+  };
+  if (!idle && !byHand) { await seen('left to Claude Code (not an idle compaction)'); return next(e); }
+  const on = (await connected($)) && !(await compactBlocked($)) && (await $.env.get('TROXY_MASK')) !== '0' && !(await switchedOff($, 'idle_compact'));
+  if (byHand && !on) { await seen('left to Claude Code (Troxy is off here)'); return next(e); } // a typed /compact stays Claude Code's own
+  if (idle) {
+    const win = Number(ctx.window) || 0;
+    if (win && tokens >= win * ENGINE_NEAR_LIMIT) {
+      if (on) decided('near_limit');
+      await seen('left to Claude Code (close to the context limit)');
+      return next(e);
+    }
+    if (tokens >= ENGINE_NATIVE_TOKENS) {
+      if (on) decided('native');
+      await seen(`left to Claude Code (past ${ENGINE_NATIVE_TOKENS / 1000}k its own summary costs less than a trim)`);
+      return next(e);
+    }
+  }
+  // From here Troxy owns the outcome: old tool output shortened, or the conversation left exactly
+  // as it is. Never a summary: at this size Claude Code would not have compacted without Troxy.
+  if (!on) {
+    if (await connected($)) decided('off');
+    await seen('left as it is (Troxy is off, or its compaction is switched off)');
+    return { skip: 'Troxy is off, so this session is left as it is.' };
+  }
+  // The arm of the stretch this compaction serves: drawn here for the gap, kept by the returning prompt.
+  if ((await sessionArm($, sid, { gap: idle })) !== 'treated') {
+    decided('comparison');
+    await seen('left as it is (comparison stretch)');
+    return { skip: 'Troxy: comparison stretch, so this session is left as it is.' };
+  }
   let model = ls && ls.model;
-  if (!model && first) try { model = await $.session.model(); } catch {}
-  if (!model) return null;
-  if ((await sessionArm($, sid)) !== 'treated') return null; // a comparison stretch gets nothing
-  const msgs = await $.session.messages();
-  if (!Array.isArray(msgs)) return null;
-  const trimmed = Math.ceil(maskMessages(msgs).removedChars / 4);
-  const total = (((await $.session.usage()).context) || {}).tokens || messagesTokens(msgs);
-  const kept = Math.max(0, total - trimmed);
+  if (!model && byHand) try { model = await $.session.model(); } catch {}
+  const { messages, removedChars, files } = maskMessages(e.messages);
+  const trimmed = Math.ceil(removedChars / 4);
+  const kept = Math.max(0, tokens - trimmed);
   const steps = Math.max(ENGINE_DEFAULT_STEPS, sittingSteps.get(sid) || 0);
-  const d = trimDecision({ model, cold: Boolean(cold), keptTokens: kept, trimmedTokens: trimmed, stepsLeft: steps });
-  lastEngine = { ...d, cold: Boolean(cold), kept, trimmed, steps };
-  if (d.action !== 'trim') return d;
-  let r, err;
-  engineRun = d;
-  compacting = true; // if a summary does run, its call goes out as Troxy's compaction (compactionStep)
-  try { r = await $.session.compact({ instructions: COMPACT_INSTRUCTIONS }); }
-  catch (x) { err = x; }
-  finally { compacting = false; engineRun = null; }
-  // What the trim call came to, on the usage row next to the decision (1.44.0 decided to trim in
-  // real sessions and nothing was trimmed, with no trace of why).
-  const short = (v) => String(v).slice(0, 160);
-  lastEngine.out = err ? `error: ${short((err && err.message) || err)}` : !r ? 'empty' : r.skip ? `skip: ${short(r.skip)}` : 'ok';
-  if (err || !r || r.skip) return d;
-  const k = n => `${Math.round(n / 1000)}k`;
-  const what = lastMask === 'stub' ? 'trimmed old tool output' : 'compacted this session';
-  await $.state.set(COMPACTED, { at: await $.clock.now(), text: r.tokensBefore && r.tokensAfter ? `${what} ${k(r.tokensBefore)} → ${k(r.tokensAfter)} tokens` : what });
-  return d;
+  // The person is away and the cache expires before they are back, so the trim is priced as cold.
+  const d = trimDecision({ model, cold: true, keptTokens: kept, trimmedTokens: trimmed, stepsLeft: steps });
+  decided(d.reason, { action: d.action, savingUsd: d.savingUsd, costUsd: d.costUsd, kept, trimmed, steps });
+  if (d.action !== 'trim') {
+    await seen(d.reason === 'unknown_model' ? 'left as it is (no cache price listed for this model)' : 'left as it is (too little old tool output to shorten)');
+    return { skip: 'Troxy: nothing worth shortening, so this session is left as it is.' };
+  }
+  const after = messagesTokens(messages);
+  const k = (n) => `${Math.round(n / 1000)}k`;
+  const text = `trimmed old tool output ${k(before)} → ${k(after)} tokens`;
+  trimmedFiles.set(sid, new Set(files));
+  lastMask = 'stub';
+  // A precompute installs nothing yet: Claude Code keeps the answer for the compaction that comes.
+  if (e.trigger === 'precompute') await seen(`${text} (prepared ahead, used at the next compaction)`);
+  else {
+    try { await $.state.set(COMPACTED, { at: now, text }); } catch {}
+    await seen(text);
+  }
+  return { messages, tokensBefore: before, tokensAfter: after };
 }
 // What the next usage row says about the engine (levers.engine), then cleared so it is said once:
 // the decision (a: trim or none, why, the predicted save and cost in USD, cold 1 or 0, kept and
-// trimmed tokens, steps expected) and reread, the number of shortened files Claude read again.
+// trimmed tokens, steps expected), trig (the trigger Claude Code gave the compaction), idle (minutes
+// since the last step), and reread, the number of shortened files Claude read again.
 let rereads = 0;
 function takeEngine() {
   const d = lastEngine, n = rereads;
   lastEngine = null;
   rereads = 0;
   if (!d && !n) return null;
-  return { ...(d ? { a: d.action, why: d.reason, save: d.savingUsd, cost: d.costUsd, cold: d.cold ? 1 : 0, kept: d.kept, trimmed: d.trimmed, steps: d.steps, ...(d.out ? { out: d.out } : {}) } : {}),
+  return { ...(d ? { a: d.action, why: d.reason, save: d.savingUsd, cost: d.costUsd, cold: d.cold ? 1 : 0, kept: d.kept, trimmed: d.trimmed, steps: d.steps,
+    ...(d.trig ? { trig: d.trig } : {}), ...(typeof d.idle === 'number' ? { idle: d.idle } : {}) } : {}),
     ...(n ? { reread: n } : {}) };
 }
 // The quality signal: Claude reads a file again whose earlier output the engine shortened. Each
@@ -1201,61 +1284,25 @@ async function noteReread($, e, next) {
   return next(e);
 }
 
-// Engine mode after an answer: no idle timer and nothing kept awake. The idle start is kept on disk
-// for the trim on return (a restart loses lastSent), and past 200k the engine is asked, after the
-// same short delay as before, whether a warm trim pays. A prompt typed first cancels it (scorePrompt).
-async function engineAfterTurn($, e) {
+// Engine mode after an answer: no timer, no compaction call, nothing kept awake. Only the idle
+// start is kept on disk, so the idle hook can tell how long the session has sat (idleFor).
+async function engineAfterTurn($) {
   cancelCompact();
   try {
-    Promise.all([$.session.id(), $.clock.now()])
-      .then(([sid, at]) => $.store.set(`idle_started_${sid}`, at)).catch(() => {});
+    const [sid, at] = await Promise.all([$.session.id(), $.clock.now()]);
+    await $.store.set(`idle_started_${sid}`, at);
   } catch {}
-  let big = false;
-  try {
-    big = afterTurnDelay({ tokens: ((await $.session.usage()).context || {}).tokens || 0,
-      on: afterAnswerAllowed(e) && await bigCompactOn($), off: await $.store.get('compactOff') }) !== COMPACT_IDLE_MS;
-  } catch {}
-  const idleAt = await $.clock.now();
-  if (big) {
-    compactTimer = $.clock.after(BIG_COMPACT_DELAY_MS, () => {
-      compactTimer = null;
-      engineTrim($, { cold: false }).catch(() => {}).finally(() => armEngineReturn($, idleAt));
-    });
-  } else armEngineReturn($, idleAt);
-  return big;
+  return false;
 }
-// The trim on return. It cannot be made when the prompt arrives (Claude Code refuses a compaction
-// from a prompt.submit hook), so it is made between turns, as soon as the cache has expired: a
-// short timer that reads the wall clock. A sleeping Mac freezes the timer, so it fires within
-// ENGINE_POLL_MS of waking, and nothing is kept awake. A prompt typed first cancels it (scorePrompt).
-// ponytail: a prompt sent within ENGINE_POLL_MS of waking, or after a restart, goes out untrimmed.
-const ENGINE_POLL_MS = 30 * 1000;
-function armEngineReturn($, idleAt) {
-  if (compactTimer) return; // something newer is armed
-  const timer = $.clock.after(ENGINE_POLL_MS, async () => {
-    if (compactTimer !== timer) return;
-    compactTimer = null;
-    try {
-      if ((await $.clock.now()) - idleAt < ENGINE_COLD_MS) return armEngineReturn($, idleAt);
-      await engineTrim($, { cold: true });
-    } catch {}
-  });
-  compactTimer = timer;
-}
-// TROXY_ENGINE_TRIM_FIRST=1, for the fork benchmark only: a forked session has a new id, so Troxy
-// has no record of it and would leave it alone. With the switch, a session Troxy has not seen is
-// trimmed a moment after it starts, before its first prompt, as a return after a break.
-const ENGINE_FIRST_DELAY_MS = 1000;
-async function engineTrimFirst($) {
-  if (!(await engineOn($)) || (await $.env.get('TROXY_ENGINE_TRIM_FIRST')) !== '1') return false;
-  if (await lastSentFor($, await $.session.id())) return false;
-  cancelCompact();
-  const timer = $.clock.after(ENGINE_FIRST_DELAY_MS, () => {
-    if (compactTimer === timer) compactTimer = null;
-    engineTrim($, { cold: true, first: true }).catch(() => {});
-  });
-  compactTimer = timer;
-  return true;
+// The session.compact hook. It fails open: on an error of Troxy's, Claude Code compacts as it would alone.
+async function onCompact($, e, next) {
+  let r;
+  try { r = await maskCompact($, e, next); } catch (err) { if (next.called) throw err; r = await next(e); }
+  // Compacted: the next step is a cold moment. In engine mode only when something was installed:
+  // a skip or a precompute leaves the conversation, and its cache, as they are.
+  const installed = Boolean(r && r.messages) && e.trigger !== 'precompute';
+  if (!e.agentId && (installed || !(await engineOn($).catch(() => false)))) coldNext.add(await $.session.id());
+  return r;
 }
 
 // /model wins (launch re-review 2026-11-12). A typed /model names the model the person wants now,
@@ -1413,7 +1460,6 @@ export function register(on) {
     $.ui.status(undefined); // the bar moved to the band above the prompt
     connectDevice($).catch(() => {}); // first run without a key: show a connect code
     armCompact($, COMPACT_IDLE_MS); // a hot reload cancels the old timer
-    try { await engineTrimFirst($); } catch {}
     return next(e);
   });
   on('command.run', { command: 'troxy' }, async ($, e) => {
@@ -1450,7 +1496,9 @@ export function register(on) {
     if (connect) return { text: connect };
     return { text: statusText({ version: manifest.version, paused: r.paused || await switchedOff($, 'routing'), allPaused: await allOff($), savings: (await $.state.get(SAVINGS)).value, rateLimits: (await $.session.usage()).rateLimits,
       compactOff: Boolean(await $.store.get('compactOff')) || await switchedOff($, 'idle_compact'), settingsOff,
-      concise: await conciseOn($).catch(() => false), engine: await engineOn($).catch(() => false) }) };
+      concise: await conciseOn($).catch(() => false), engine: await engineOn($).catch(() => false),
+      idleMin: nativeIdleMin(await $.env.get('CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS')),
+      engineSeen: await Promise.resolve($.store.get(`engine_seen:${await $.session.id()}`)).catch(() => null) }) };
   });
   // Routing fails open: a scorer or hook error must never break the session,
   // it just means the requested model is used as-is.
@@ -1458,12 +1506,7 @@ export function register(on) {
   on('command.run', { command: 'model' }, pinModel).catch(async ($, e, next) => next(e));
   on('prompt.compose', composeConcise).catch(async ($, e, next) => next(e));
   on('command.run', { command: 'rewind' }, async ($, e, next) => { try { await noteRegret($, await $.session.id()); } catch {} return next(e); });
-  on('session.compact', async ($, e, next) => {
-    let r;
-    try { r = await maskCompact($, e, next); } catch (err) { if (next.called) throw err; r = await next(e); } // stubbing fails open
-    if (!e.agentId) coldNext.add(await $.session.id()); // compacted: the next step is a cold moment
-    return r;
-  });
+  on('session.compact', onCompact);
   on('agent.spawn', routeSpawn).catch(async ($, e, next) => next(e));
   on('turn.step', routeStep).catch(async function* ($, e, next) { return yield* next(e); });
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -1506,7 +1549,7 @@ export function register(on) {
       } catch {} // a missed turn only leaves the band as it was
     }
     if (await engineOn($).catch(() => false)) {
-      try { await engineAfterTurn($, e); } catch {}
+      try { await engineAfterTurn($); } catch {}
       return r;
     }
     let stayAwake = false, delay = COMPACT_IDLE_MS;
@@ -1521,4 +1564,4 @@ export function register(on) {
 }
 
 // Exported for tests only - not part of the mod's runtime contract.
-export const _internal = { armEngineReturn, engineTrimFirst, ENGINE_POLL_MS, noteReread, takeEngine, engineOn, engineTrim, engineAfterTurn, trimmedFiles, sittingSteps, ENGINE_COLD_MS, ENGINE_SUMMARY_ABOVE, takeLastEngine: () => lastEngine, trimDecision, enginePrice, ENGINE_MARGIN, ENGINE_DEFAULT_STEPS, ENGINE_MIN_TRIM_TOKENS, homeDir, isScript, composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
+export const _internal = { onCompact, engineCompact, nativeIdleMin, idleFor, coldNext, ENGINE_IDLE_MS, ENGINE_NATIVE_TOKENS, ENGINE_NEAR_LIMIT, noteReread, takeEngine, engineOn, engineAfterTurn, trimmedFiles, sittingSteps, takeLastEngine: () => lastEngine, trimDecision, enginePrice, ENGINE_MARGIN, ENGINE_DEFAULT_STEPS, ENGINE_MIN_TRIM_TOKENS, homeDir, isScript, composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
