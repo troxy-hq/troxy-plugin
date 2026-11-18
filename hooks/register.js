@@ -540,9 +540,9 @@ function statusText({ version, paused, allPaused = false, savings, rateLimits = 
   if (meter.length) lines.push(`Plan usage now: ${meter.join(' · ')}`);
   lines.push('The model is picked at the start, after an hour idle or after a compaction, then kept (switching would rewrite the cache). /model always wins.');
   if (engine && !compactOff) {
-    lines.push('Engine mode is on (TROXY_ENGINE=1): when Claude Code compacts this session after about an hour idle, Troxy shortens old tool output instead of a summary replacing the conversation. Your messages and the answers are kept. Troxy starts no compaction itself and keeps nothing awake (/troxy compact off).');
+    lines.push('Engine mode is on (TROXY_ENGINE=1): when Claude Code compacts this session after about an hour idle, Troxy shortens old tool output instead of a summary replacing the conversation. Your messages and the answers are kept. Only a session that is a few steps from being summarized anyway gets Claude Code\'s own summary then, while that is still cheap. Troxy starts no compaction itself and keeps nothing awake (/troxy compact off).');
     lines.push(idleMin < ENGINE_NATIVE_TOKENS
-      ? `It acts on idle sessions from ${Math.round(idleMin / 1000)}k to ${ENGINE_NATIVE_TOKENS / 1000}k tokens. Past that, Claude Code's own summary runs, as without Troxy.`
+      ? `It acts on idle sessions from ${Math.round(idleMin / 1000)}k to ${ENGINE_NATIVE_TOKENS / 1000}k tokens that use the one-hour prompt cache: Claude Code compacts no other session while idle. Past ${ENGINE_NATIVE_TOKENS / 1000}k, Claude Code's own summary runs, as without Troxy.`
       : `Nothing for it to act on yet: Claude Code only compacts idle sessions past ${Math.round(idleMin / 1000)}k tokens, and there its own summary runs. Start Claude Code with CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=100000.`);
     if (engineSeen && engineSeen.did) {
       lines.push(`Last compaction seen in this session: ${engineSeen.trigger}${typeof engineSeen.idleMin === 'number' ? `, ${engineSeen.idleMin} min after the last step` : ''}, ${Math.round((engineSeen.tokens || 0) / 1000)}k tokens: ${engineSeen.did}.`);
@@ -1138,15 +1138,23 @@ async function maskCompact($, e, next) {
 // A compaction Claude Code starts does run this hook, and the hook may answer with the messages.
 //
 // An idle compaction is a compaction Claude Code starts (trigger auto or precompute) at least
-// ENGINE_IDLE_MS after the last step, in a session that is not close to its context limit:
+// ENGINE_IDLE_MS after the last step. In a real session it came with trigger auto, 54 minutes
+// after the last step (2026-11-18): Claude Code fires it at 0.9 of the one-hour cache lifetime,
+// and only in a session whose last request used the one-hour cache.
 //   - At or past 200k tokens: untouched, in both arms. That is the size Claude Code compacts on
 //     its own, and its summary costs less than a trim (it leaves far fewer tokens).
 //   - Under 200k: reached only when CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS is lowered (100000 is the
-//     lowest Claude Code accepts). Here Troxy owns the outcome. A treated stretch gets old tool
-//     output shortened: every message and every answer is kept, and no model is called. Anything
-//     else (a comparison stretch, /troxy off, compaction switched off, too little to shorten)
-//     leaves the conversation exactly as it is, which is what Claude Code does at that size
-//     without Troxy. Never a summary.
+//     lowest Claude Code accepts). Here Troxy owns the outcome. A comparison stretch, /troxy off
+//     and compaction switched off leave the conversation exactly as it is, which is what Claude
+//     Code does at that size without Troxy. A treated stretch gets one of two things:
+//       - Close to its compaction limit: Claude Code's own summary goes in now. "Close" is what
+//         Claude Code says itself: it has written its summary ahead (a precompute, see below), or
+//         the context is at ENGINE_NEAR_LIMIT of the window. That summary was a few steps away in
+//         any case and is already paid for; going in while the cache is warm, the return rewrites
+//         a short summary instead of the whole conversation. A trim here threw the summary that
+//         was written ahead away (seen in that same session: 58 seconds of writing, discarded).
+//       - Otherwise old tool output is shortened: every message and every answer is kept, and no
+//         model is called. Too little to shorten: left as it is.
 // Everything else goes through untouched: a compaction because the context is full, a /compact the
 // person types, another plugin's compaction, a subagent's transcript, a session Troxy has not seen.
 // TROXY_ENGINE_MANUAL=1, for the manual check and the fork benchmark only: a typed /compact is
@@ -1154,7 +1162,10 @@ async function maskCompact($, e, next) {
 const ENGINE_IDLE_MS = 45 * 60 * 1000; // Claude Code's idle compaction runs after "about an hour"
 const ENGINE_NATIVE_TOKENS = 200000; // Claude Code's default idle compaction threshold
 const ENGINE_NATIVE_MIN_TOKENS = 100000; // the lowest threshold it accepts
-const ENGINE_NEAR_LIMIT = 0.8; // from this share of the context window a compaction may be needed to go on: never answered here
+const ENGINE_NEAR_LIMIT = 0.8; // from this share of the context window Claude Code's summary is a few steps away anyway
+// A summary written ahead counts while the context is still about the size it was written at. After
+// a rewind the session is smaller, the summary no longer fits it, and Claude Code drops it too.
+const ENGINE_PREPARED_SLACK = 0.95;
 async function engineOn($) {
   return (await $.env.get('TROXY_ENGINE')) === '1';
 }
@@ -1202,24 +1213,25 @@ async function engineCompact($, e, next) {
   const decided = (reason, d = {}) => {
     lastEngine = { action: 'none', reason, savingUsd: 0, costUsd: 0, kept: tokens, trimmed: 0, steps: 0, ...d, cold: true, trig: String(e.trigger), idle: idleMin };
   };
-  if (!idle && !byHand) { await seen('left to Claude Code (not an idle compaction)'); return next(e); }
+  if (!idle && !byHand) {
+    // A precompute while the person is working: Claude Code writes its summary ahead because it
+    // expects to compact soon. It goes through untouched, and is kept on disk so the idle
+    // compaction can tell that the summary is ready (below).
+    if (e.trigger === 'precompute') {
+      try { await $.store.set(`engine_prepared:${sid}`, { at: now, tokens }); } catch {}
+      await seen('left to Claude Code (it writes its summary ahead: this session is close to its compaction limit)');
+    } else await seen('left to Claude Code (not an idle compaction)');
+    return next(e);
+  }
   const on = (await connected($)) && !(await compactBlocked($)) && (await $.env.get('TROXY_MASK')) !== '0' && !(await switchedOff($, 'idle_compact'));
   if (byHand && !on) { await seen('left to Claude Code (Troxy is off here)'); return next(e); } // a typed /compact stays Claude Code's own
-  if (idle) {
-    const win = Number(ctx.window) || 0;
-    if (win && tokens >= win * ENGINE_NEAR_LIMIT) {
-      if (on) decided('near_limit');
-      await seen('left to Claude Code (close to the context limit)');
-      return next(e);
-    }
-    if (tokens >= ENGINE_NATIVE_TOKENS) {
-      if (on) decided('native');
-      await seen(`left to Claude Code (past ${ENGINE_NATIVE_TOKENS / 1000}k its own summary costs less than a trim)`);
-      return next(e);
-    }
+  if (idle && tokens >= ENGINE_NATIVE_TOKENS) {
+    if (on) decided('native');
+    await seen(`left to Claude Code (past ${ENGINE_NATIVE_TOKENS / 1000}k its own summary costs less than a trim)`);
+    return next(e);
   }
-  // From here Troxy owns the outcome: old tool output shortened, or the conversation left exactly
-  // as it is. Never a summary: at this size Claude Code would not have compacted without Troxy.
+  // From here Troxy owns the outcome. Off, or a comparison stretch: the conversation is left exactly
+  // as it is, as Claude Code leaves a session of this size without Troxy.
   if (!on) {
     if (await connected($)) decided('off');
     await seen('left as it is (Troxy is off, or its compaction is switched off)');
@@ -1230,6 +1242,18 @@ async function engineCompact($, e, next) {
     decided('comparison');
     await seen('left as it is (comparison stretch)');
     return { skip: 'Troxy: comparison stretch, so this session is left as it is.' };
+  }
+  // A treated stretch close to its compaction limit: Claude Code's own summary goes in now.
+  if (idle) {
+    let prepared = null;
+    try { prepared = await $.store.get(`engine_prepared:${sid}`); } catch {}
+    const ready = Boolean(prepared) && tokens >= (Number(prepared.tokens) || 0) * ENGINE_PREPARED_SLACK;
+    const win = Number(ctx.window) || 0;
+    if (ready || (win && tokens >= win * ENGINE_NEAR_LIMIT)) {
+      decided('near_limit');
+      await seen(ready ? 'left to Claude Code (its summary was written ahead and a few steps away anyway: it costs least now)' : 'left to Claude Code (close to the context limit)');
+      return next(e);
+    }
   }
   let model = ls && ls.model;
   if (!model && byHand) try { model = await $.session.model(); } catch {}
@@ -1246,7 +1270,9 @@ async function engineCompact($, e, next) {
   }
   const after = messagesTokens(messages);
   const k = (n) => `${Math.round(n / 1000)}k`;
-  const text = `trimmed old tool output ${k(before)} → ${k(after)} tokens`;
+  // Said against the whole context, not the messages' own estimate: "46k → 26k" on a 166k session
+  // read as a halving, when about 20k of the 166k had gone (real session, 2026-11-18).
+  const text = `trimmed about ${k(trimmed)} tokens of old tool output (${k(tokens)} → about ${k(kept)})`;
   trimmedFiles.set(sid, new Set(files));
   lastMask = 'stub';
   // A precompute installs nothing yet: Claude Code keeps the answer for the compaction that comes.
@@ -1301,7 +1327,10 @@ async function onCompact($, e, next) {
   // Compacted: the next step is a cold moment. In engine mode only when something was installed:
   // a skip or a precompute leaves the conversation, and its cache, as they are.
   const installed = Boolean(r && r.messages) && e.trigger !== 'precompute';
-  if (!e.agentId && (installed || !(await engineOn($).catch(() => false)))) coldNext.add(await $.session.id());
+  const engine = await engineOn($).catch(() => false);
+  if (!e.agentId && (installed || !engine)) coldNext.add(await $.session.id());
+  // Whatever went in, a summary Claude Code had written ahead is gone with it.
+  if (!e.agentId && installed && engine) try { await $.store.set(`engine_prepared:${await $.session.id()}`, null); } catch {}
   return r;
 }
 
@@ -1564,4 +1593,4 @@ export function register(on) {
 }
 
 // Exported for tests only - not part of the mod's runtime contract.
-export const _internal = { onCompact, engineCompact, nativeIdleMin, idleFor, coldNext, ENGINE_IDLE_MS, ENGINE_NATIVE_TOKENS, ENGINE_NEAR_LIMIT, noteReread, takeEngine, engineOn, engineAfterTurn, trimmedFiles, sittingSteps, takeLastEngine: () => lastEngine, trimDecision, enginePrice, ENGINE_MARGIN, ENGINE_DEFAULT_STEPS, ENGINE_MIN_TRIM_TOKENS, homeDir, isScript, composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
+export const _internal = { onCompact, engineCompact, nativeIdleMin, idleFor, coldNext, ENGINE_IDLE_MS, ENGINE_NATIVE_TOKENS, ENGINE_NEAR_LIMIT, ENGINE_PREPARED_SLACK, noteReread, takeEngine, engineOn, engineAfterTurn, trimmedFiles, sittingSteps, takeLastEngine: () => lastEngine, trimDecision, enginePrice, ENGINE_MARGIN, ENGINE_DEFAULT_STEPS, ENGINE_MIN_TRIM_TOKENS, homeDir, isScript, composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
