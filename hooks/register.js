@@ -496,7 +496,11 @@ async function noteStep($, result, meta) {
   const sid = await $.session.id();
   const mask = lastMask; lastMask = null;
   const clear = await clearFlags($, sid, await $.clock.now());
-  const addonVersion = await addonVersionOf($), stretch = await stretchOf($, sid), engine = takeEngine();
+  const addonVersion = await addonVersionOf($), engine = takeEngine();
+  // An arm set by TROXY_ARM (test only) is not a draw: the row carries no arm and no stretch.
+  const forced = await forcedArm($);
+  if (forced) meta = { ...meta, arm: null, subArm: null, cutArm: null };
+  const stretch = forced ? null : await stretchOf($, sid);
   pending.push(reportRow({ ...meta, mask, clear, addonVersion, stretch, engine, sid, usage, compact: compacting, compactArm: meta.arm, rateLimits, surfaces, compressed: await compressedSince($, sid), recalled: await recalledSince($, sid), ts: await $.clock.now() }));
   if (pending.length > REPORT_KEEP_ROWS) pending = pending.slice(-REPORT_KEEP_ROWS);
 }
@@ -532,8 +536,9 @@ async function flushReport($) {
 }
 
 // /troxy status: everything about this session's Troxy in one place.
-function statusText({ version, paused, allPaused = false, savings, rateLimits = [], compactOff = false, settingsOff = [], concise, engine = false, idleMin = ENGINE_NATIVE_TOKENS, engineSeen = null }) {
+function statusText({ version, paused, allPaused = false, savings, rateLimits = [], compactOff = false, settingsOff = [], concise, engine = false, idleMin = ENGINE_NATIVE_TOKENS, engineSeen = null, armSet = null }) {
   const lines = [`Troxy ${version || ''}`.trim() + (allPaused ? ' · off on this machine' : ` · routing is ${paused ? 'off' : 'on'}`)];
+  if (armSet) lines.push(`TEST ONLY: TROXY_ARM sets this session to a ${armSet === 'holdout' ? 'comparison' : 'treated'} stretch. Its usage rows carry no arm and stay out of the comparison. Unset TROXY_ARM for normal use.`);
   if (allPaused) lines.push('Everything is paused: no model, effort or subagent changes, no compaction, nothing kept awake.');
   lines.push(`This session: ${savings || 'nothing moved to a lighter model yet'}`);
   const meter = rateLimits.filter(w => WINDOW_LABEL[w.kind]).map(w => `${WINDOW_LABEL[w.kind]} ${Math.round(w.percentUsed)}%`);
@@ -852,7 +857,23 @@ const holdoutDraw = { fraction: 0.5 }; // 50/50 so one user's own sessions give 
 // session, which can be a few minutes before the 55: the gap has begun, so the arm of the coming
 // stretch is drawn there and the returning prompt keeps it. ponytail: a stretch still inherits the context the one before
 // left, which pulls the gap toward 0; per-session arms need more users than we have.
+// Test only: TROXY_ARM=treated or TROXY_ARM=holdout sets the arm instead of drawing it, so a check
+// that needs one arm does not cost an hour per coin toss (engine check 3, 2026-11-19). A stretch
+// with a set arm is not a random one and must never reach the comparison: nothing is stored for
+// it, and its rows carry no arm and no stretch (noteStep), which every readout leaves out. The arm
+// and the stretch on disk are cleared, so the first ask once the variable is gone draws afresh.
+async function forcedArm($) {
+  try { const v = await $.env.get('TROXY_ARM'); return v === 'treated' || v === 'holdout' ? v : null; } catch { return null; }
+}
 async function sessionArm($, sid, { gap = false } = {}) {
+  const forced = await forcedArm($);
+  if (forced) {
+    try {
+      if ((await $.store.get(`arm:${sid}`)) != null) { await $.store.set(`arm:${sid}`, null); await $.store.set(`arm_at:${sid}`, null); }
+      if ((await $.store.get(`stretch:${sid}`)) != null) await $.store.set(`stretch:${sid}`, null);
+    } catch {}
+    return forced;
+  }
   const now = await $.clock.now();
   const ls = await lastSentFor($, sid);
   let arm = null, at = null;
@@ -955,7 +976,7 @@ function subagentTarget({ arm, subagentType, model, fork, isTeammate, parentMode
 }
 async function routeSpawn($, e, next) {
   let arm = null, off = true;
-  try { arm = await $.store.get(`arm:${await $.session.id()}`); off = !(await connected($)) || await routingOff($); } catch {}
+  try { arm = (await forcedArm($)) || (await $.store.get(`arm:${await $.session.id()}`)); off = !(await connected($)) || await routingOff($); } catch {}
   const target = off ? null : subagentTarget({ ...e, arm });
   if (!target) return next(e);
   const r = await next({ ...e, model: target });
@@ -1527,7 +1548,8 @@ export function register(on) {
       compactOff: Boolean(await $.store.get('compactOff')) || await switchedOff($, 'idle_compact'), settingsOff,
       concise: await conciseOn($).catch(() => false), engine: await engineOn($).catch(() => false),
       idleMin: nativeIdleMin(await $.env.get('CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS')),
-      engineSeen: await Promise.resolve($.store.get(`engine_seen:${await $.session.id()}`)).catch(() => null) }) };
+      engineSeen: await Promise.resolve($.store.get(`engine_seen:${await $.session.id()}`)).catch(() => null),
+      armSet: await forcedArm($) }) };
   });
   // Routing fails open: a scorer or hook error must never break the session,
   // it just means the requested model is used as-is.
@@ -1593,4 +1615,4 @@ export function register(on) {
 }
 
 // Exported for tests only - not part of the mod's runtime contract.
-export const _internal = { onCompact, engineCompact, nativeIdleMin, idleFor, coldNext, ENGINE_IDLE_MS, ENGINE_NATIVE_TOKENS, ENGINE_NEAR_LIMIT, ENGINE_PREPARED_SLACK, noteReread, takeEngine, engineOn, engineAfterTurn, trimmedFiles, sittingSteps, takeLastEngine: () => lastEngine, trimDecision, enginePrice, ENGINE_MARGIN, ENGINE_DEFAULT_STEPS, ENGINE_MIN_TRIM_TOKENS, homeDir, isScript, composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
+export const _internal = { onCompact, engineCompact, nativeIdleMin, idleFor, coldNext, ENGINE_IDLE_MS, ENGINE_NATIVE_TOKENS, ENGINE_NEAR_LIMIT, ENGINE_PREPARED_SLACK, noteReread, takeEngine, engineOn, engineAfterTurn, trimmedFiles, sittingSteps, takeLastEngine: () => lastEngine, trimDecision, enginePrice, ENGINE_MARGIN, ENGINE_DEFAULT_STEPS, ENGINE_MIN_TRIM_TOKENS, homeDir, isScript, composeConcise, conciseOn, conciseBySession, CONCISE, holdoutDraw, sessionArm, forcedArm, connectDevice, clearHint, clearFlags, effortSwapOn, effortText, EFFORT_DEFAULT, compressedSince, recalledSince, stepEffort, reportRow, noteStep, flushReport, pendingRows: () => pending, troxyConfig, logSent, askedFor, rememberAsked, asked, armCompact, cancelCompact, afterTurnDelay, bigCompactOn, bigSession, firstSightStretch, connected, idleCompact, switchedOff, toDomainAndFields, guardBash, failClosed, parseScore, asRequest, pickModel, troxyCommand, modRouteFile, estimateTokens, MODELS, savedLine, routeText, sessionLine, addTurn, withKept, statusText, compactPlan, savingsText, fetchSavings, scorePrompt, routeStep, routeSpawn, subagentTarget, userCut, noteRegret, cutFor, lastRouted, maskMessages, messagesTokens, maskCompact, pinModel, pins, connectFailed, addonVersionOf, stretchOf, allOff, leversOff, compactBlocked, afterAnswerAllowed, setInteractive: (v) => { interactive = v; }, subAgents, stepModel, lastSent };
