@@ -1054,8 +1054,10 @@ function maskMessages(messages) {
     return {
       ...rest,
       toolUses: (m.toolUses || []).map(u => {
+        // A tool use's `text` mirrors its result for reading only: the request carries the output in
+        // the user message's tool_result, so only toolResults count as removed (11-21: an idle trim
+        // reported 10k from this mirror alone while the real result, a recent message, went whole).
         const long = stubbable(u.tool, u.text);
-        if (long) { removed += String(u.text).length - MASK_HEAD_CHARS; if (pathOf.has(u.tool_use_id)) files.add(pathOf.get(u.tool_use_id)); }
         const { result, ...k } = u;
         return { ...k, input: stubInput(u.input), ...(u.text === undefined ? {} : { text: long ? stub(u.tool, u.text) : u.text }) };
       }),
@@ -1073,7 +1075,7 @@ function messagesTokens(messages) {
   let n = 0;
   for (const m of messages) {
     n += String(m.text || '').length;
-    for (const u of m.toolUses || []) n += JSON.stringify(u.input || {}).length + String(u.text || '').length;
+    for (const u of m.toolUses || []) n += JSON.stringify(u.input || {}).length; // u.text mirrors the result, counted below
     for (const r of m.toolResults || []) n += String(r.text || '').length;
   }
   return Math.ceil(n / 4);
